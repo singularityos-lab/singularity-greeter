@@ -12,6 +12,7 @@ xkb_dep       = dependency('xkbcommon')
 glib_dep      = dependency('glib-2.0')
 gio_dep       = dependency('gio-2.0')
 json_dep      = dependency('json-glib-1.0')
+fc_dep        = dependency('fontconfig')
 
 loginui_dep = dependency('singularity-loginui',
   fallback: ['singularity-loginui', 'loginui_dep']
@@ -35,7 +36,7 @@ ls_h = custom_target('wlr-layer-shell-unstable-v1-client-protocol.h',
 
 executable('singularity-greeter',
   ['src/greeter_main.c', xdg_c, xdg_h, ls_c, ls_h],
-  dependencies: [wl_client_dep, xkb_dep, glib_dep, gio_dep, json_dep, loginui_dep],
+  dependencies: [wl_client_dep, xkb_dep, glib_dep, gio_dep, json_dep, loginui_dep, fc_dep],
   install: true,
 )
 

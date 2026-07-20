@@ -4,7 +4,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <time.h>
 #include <poll.h>
 #include <pwd.h>
@@ -18,6 +22,7 @@
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-keysyms.h>
 #include <cairo/cairo.h>
+#include <fontconfig/fontconfig.h>
 #include <glib.h>
 #include <gio/gio.h>
 #include <json-glib/json-glib.h>
@@ -51,6 +56,10 @@ static char password[1024];
 static size_t password_len = 0;
 static char pending_password[1024];
 static char status_text[128] = "";
+static bool auth_is_pin = false; /* SintyOS: the credential is a PIN, not a Unix password */
+static bool recovery_mode = false; /* --recovery: forgotten-PIN escape hatch, launched as root by sinty-greetd-launch */
+static int recovery_step = 0;      /* 0 = enter recovery code, 1 = enter new PIN */
+static char recovery_code[256] = "";
 static bool status_error = false;
 static bool awaiting_auth = false;
 
@@ -138,6 +147,10 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     st.password_dots = (int)password_len;
     st.status_text = status_text[0] ? status_text : NULL;
     st.status_error = status_error;
+    if (recovery_mode)
+        st.auth_label = recovery_step == 0 ? "Recovery code" : "New PIN";
+    else
+        st.auth_label = auth_is_pin ? "PIN" : "Password";
 
     double cx, cy, cw, ch;
     loginui_render(cr, &st, &cx, &cy, &cw, &ch);
@@ -306,8 +319,67 @@ static bool read_exact(int fd, void *buf, size_t n) {
     return true;
 }
 
+/* recovery escape hatch: the greeter stays UNPRIVILEGED. It sends {uid, code, new PIN}
+ * to sinty-recoverd (root daemon) over its unix socket; the daemon runs the privileged
+ * `sintykey recover`. Auth is the recovery code; a wrong one is rejected by sintykey. */
+static void run_recover(const char *code, const char *newpin) {
+    struct passwd *pw = (n_users > 0) ? getpwnam(users[sel_user].username) : NULL;
+    if (!pw) { snprintf(status_text, sizeof status_text, "User not found"); status_error = true; recovery_step = 0; render_all(); return; }
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    /* bound the round-trip: this runs on the Wayland event-loop thread, so a hung
+     * recoverd would freeze the whole greeter (no login for anyone). A timeout reads
+     * as failure (fail-closed) and returns control. */
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    if (s >= 0) {
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    }
+    struct sockaddr_un a; memset(&a, 0, sizeof a);
+    a.sun_family = AF_UNIX;
+    strncpy(a.sun_path, "/run/sinty-recoverd.sock", sizeof a.sun_path - 1);
+    if (s < 0 || connect(s, (struct sockaddr *)&a, sizeof a) != 0) {
+        if (s >= 0) close(s);
+        snprintf(status_text, sizeof status_text, "Recovery service unavailable");
+        status_error = true; recovery_step = 0; render_all(); return;
+    }
+    dprintf(s, "%u\n%s\n%s\n", (unsigned)pw->pw_uid, code, newpin);
+    char resp[32] = {0};
+    ssize_t n = read(s, resp, sizeof resp - 1);
+    close(s);
+    if (n >= 3 && strncmp(resp, "OK\n", 3) == 0) {
+        snprintf(status_text, sizeof status_text, "PIN reset. Log in with your new PIN.");
+        status_error = false;
+        recovery_mode = false; recovery_step = 0; /* back to the normal login, same session */
+    } else if (n > 0 && strncmp(resp, "BLOCKED", 7) == 0) {
+        snprintf(status_text, sizeof status_text, "Too many attempts. Try again later.");
+        status_error = true; recovery_step = 0;
+    } else {
+        snprintf(status_text, sizeof status_text, "Recovery failed. Check your recovery code.");
+        status_error = true; recovery_step = 0;
+    }
+    render_all();
+}
+
+static void submit_recovery(void) {
+    if (recovery_step == 0) {
+        g_strlcpy(recovery_code, password, sizeof recovery_code);
+        memset(password, 0, sizeof password); password_len = 0;
+        recovery_step = 1;
+        status_text[0] = '\0'; status_error = false;
+        render_all();
+        return;
+    }
+    char newpin[1024]; g_strlcpy(newpin, password, sizeof newpin);
+    memset(password, 0, sizeof password); password_len = 0;
+    run_recover(recovery_code, newpin);
+    memset(recovery_code, 0, sizeof recovery_code);
+    memset(newpin, 0, sizeof newpin);
+}
+
 static void submit_password(void) {
-    if (password_len == 0 || n_users == 0) return;
+    if (password_len == 0) return;
+    if (recovery_mode) { submit_recovery(); return; }
+    if (n_users == 0) return;
     g_strlcpy(pending_password, password, sizeof pending_password);
     memset(password, 0, sizeof password);
     password_len = 0;
@@ -390,10 +462,18 @@ static bool greetd_connect(void) {
 
 static void power_action(int which) {
     if (preview) return;
-    const char *cmd = which == 0 ? "systemctl suspend"
-                    : which == 1 ? "systemctl reboot"
-                                 : "systemctl poweroff";
+    /* Drive power via login1 on the system bus. Under sinit there is no systemd, so
+     * `systemctl reboot/poweroff` was a no-op; sinty-logind serves login1 as root and
+     * maps Reboot/PowerOff/Suspend to sinit reboot/poweroff and the kernel. */
+    const char *method = which == 0 ? "Suspend"
+                       : which == 1 ? "Reboot"
+                                    : "PowerOff";
+    char *cmd = g_strdup_printf(
+        "gdbus call --system --dest org.freedesktop.login1 "
+        "--object-path /org/freedesktop/login1 "
+        "--method org.freedesktop.login1.Manager.%s false", method);
     g_spawn_command_line_async(cmd, NULL);
+    g_free(cmd);
 }
 
 /* ── users / sessions / assets ──────────────────────────────────────────── */
@@ -538,6 +618,7 @@ static void find_os_logo(void) {
         g_strfreev(lines);
         g_free(content);
     }
+    auth_is_pin = (id[0] != '\0' && g_str_has_prefix(id, "sinty"));
     if (try_logo_file(logo)) return;
     if (try_logo_file(id)) return;
     try_logo_file("emblem-singularity");
@@ -567,7 +648,7 @@ static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t t
     if (in_rect(&power_hit)) { power_open = !power_open; render_all(); return; }
     if (in_rect(&session_hit) && n_sessions > 1) { sel_session = (sel_session + 1) % n_sessions; render_all(); return; }
     for (int i = 0; i < n_users; i++) if (in_rect(&user_hit[i])) {
-        sel_user = i; status_text[0] = '\0'; password_len = 0; password[0] = '\0'; render_all(); return;
+        sel_user = i; status_text[0] = '\0'; memset(password, 0, sizeof password); password_len = 0; render_all(); return;
     }
 }
 static void pt_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) {}
@@ -620,12 +701,24 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         render_all();
         return;
     case XKB_KEY_Escape:
-        password_len = 0; password[0] = '\0'; status_text[0] = '\0';
+        if (recovery_mode) { recovery_mode = false; recovery_step = 0; }
+        memset(password, 0, sizeof password); password_len = 0; status_text[0] = '\0';
         power_open = false;
         render_all();
         return;
     case XKB_KEY_Tab:
-        if (n_users > 1) { sel_user = (sel_user + 1) % n_users; password_len = 0; password[0] = '\0'; status_text[0] = '\0'; render_all(); }
+        if (n_users > 1) { sel_user = (sel_user + 1) % n_users; memset(password, 0, sizeof password); password_len = 0; status_text[0] = '\0'; render_all(); }
+        return;
+    case XKB_KEY_F1:
+        /* Forgot PIN? Enter the in-process recovery mode (the greeter stays unprivileged;
+         * the actual recover goes to sinty-recoverd). SintyOS only. */
+        if (!recovery_mode && auth_is_pin) {
+            recovery_mode = true;
+            recovery_step = 0;
+            memset(password, 0, sizeof password); password_len = 0;
+            status_text[0] = '\0'; status_error = false;
+            render_all();
+        }
         return;
     default: break;
     }
@@ -750,9 +843,16 @@ static const struct wl_registry_listener registry_listener = { reg_global, reg_r
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv) {
-    for (int i = 1; i < argc; i++)
+    for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--preview") == 0) preview = true;
+        if (strcmp(argv[i], "--recovery") == 0) recovery_mode = true;
+    }
     if (getenv("SINGULARITY_GREETER_PREVIEW")) preview = true;
+
+    /* Initialize fontconfig explicitly before any cairo text/font use. cairo
+     * otherwise auto-inits it on first use and fontconfig prints the "using
+     * without calling FcInit()" warning to stderr on every launch. */
+    FcInit();
 
     struct passwd *me = getpwuid(getuid());
     if (me && me->pw_name) snprintf(current_user, sizeof current_user, "%s", me->pw_name);
@@ -761,7 +861,7 @@ int main(int argc, char **argv) {
     load_sessions();
     find_os_logo();
 
-    if (!preview && !greetd_connect()) {
+    if (!preview && !recovery_mode && !greetd_connect()) {
         fprintf(stderr, "greeter: cannot connect to greetd ($GREETD_SOCK)\n");
         return 1;
     }
