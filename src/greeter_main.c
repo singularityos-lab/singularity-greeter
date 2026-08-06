@@ -123,6 +123,98 @@ static void draw_power_glyph(cairo_t *cr, double cx, double cy, double r) {
     cairo_stroke(cr);
 }
 
+/* The desktop session writes the reason it crash-looped to this unencrypted
+ * tmpfs file (singularity-desktop-session). On real hardware where the crash
+ * can only be seen on-device and no log can be extracted, show it here so the
+ * user can photograph it. */
+/* Diagnostic sources, in priority order. crypto-error.txt is written at sysinit
+ * (device-key/PIN unseal failure, the TPM RC) so it is visible on the greeter
+ * even when the user can never log in; last-crash.txt is the post-login desktop
+ * crash. Both are unencrypted tmpfs, readable by the greeter. */
+static const struct { const char *label; const char *path; } crash_srcs[] = {
+    { "CRYPTO (TPM device-key / PIN unseal):", "/run/atom/crypto-error.txt" },
+    { "DESKTOP:", "/run/singularity/last-crash.txt" },
+};
+static char crash_buf[8192];
+static char *crash_lines[128];
+static int crash_nlines;
+
+static bool load_crash_text(void) {
+    crash_buf[0] = 0;
+    crash_nlines = 0;
+    size_t off = 0;
+    for (unsigned s = 0; s < sizeof crash_srcs / sizeof crash_srcs[0]; s++) {
+        FILE *f = fopen(crash_srcs[s].path, "r");
+        if (!f) continue;
+        char tmp[4096];
+        size_t n = fread(tmp, 1, sizeof tmp - 1, f);
+        fclose(f);
+        tmp[n] = 0;
+        if (n == 0) continue;
+        int w = snprintf(crash_buf + off, sizeof crash_buf - off,
+                         "%s\n%s%s", crash_srcs[s].label, tmp,
+                         (n && tmp[n - 1] == '\n') ? "" : "\n");
+        if (w > 0) off += (size_t)w;
+        if (off >= sizeof crash_buf - 1) break;
+    }
+    crash_buf[sizeof crash_buf - 1] = 0;
+    if (off == 0) return false;
+    for (char *p = crash_buf; *p && crash_nlines < 128; ) {
+        char *nl = strchr(p, '\n');
+        if (nl) *nl = 0;
+        crash_lines[crash_nlines++] = p;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return crash_nlines > 0;
+}
+
+/* The crash panel is a diagnostic surface, not something an end user should see.
+ * It is shown only when explicitly enabled: the "sinty.crashpanel" kernel cmdline
+ * token (a boot-menu "diagnostics" entry, i.e. the boot shortcut) or a dev image
+ * (/etc/atom/dev.enabled). Evaluated once. */
+static int crash_panel_gate = -1;
+static bool crash_panel_enabled(void) {
+    if (crash_panel_gate >= 0) return crash_panel_gate == 1;
+    crash_panel_gate = 0;
+    if (access("/etc/atom/dev.enabled", F_OK) == 0) { crash_panel_gate = 1; return true; }
+    FILE *f = fopen("/proc/cmdline", "r");
+    if (f) {
+        char cmd[1024];
+        size_t n = fread(cmd, 1, sizeof cmd - 1, f);
+        fclose(f);
+        cmd[n] = 0;
+        if (strstr(cmd, "sinty.crashpanel")) crash_panel_gate = 1;
+    }
+    return crash_panel_gate == 1;
+}
+
+static void draw_crash_panel(cairo_t *cr, int w, int h) {
+    if (!crash_panel_enabled()) return;
+    if (!load_crash_text()) return;
+    double lh0 = 18;
+    int maxshow = (int)((h * 0.58) / lh0);   /* fit as many lines as the panel allows */
+    if (maxshow < 8) maxshow = 8;
+    if (maxshow > 120) maxshow = 120;
+    int start = (crash_nlines > maxshow) ? crash_nlines - maxshow : 0;
+    int shown = crash_nlines - start;
+    double lh = 18, pad = 14;
+    double ph = (shown + 1) * lh + pad * 2 + 8;
+    double pw = w * 0.86, px = (w - pw) / 2.0, py = h - ph - 72;
+    if (py < 8) py = 8;
+    loginui_rounded_rect(cr, px, py, pw, ph, 10);
+    cairo_set_source_rgba(cr, 0.10, 0.02, 0.02, 0.94);
+    cairo_fill(cr);
+    loginui_text(cr, "Sans Bold 13", "Desktop error - photograph this screen",
+                 px + pad, py + pad, 0, 1.0, 0.62, 0.55);
+    double ty = py + pad + lh + 6;
+    for (int i = start; i < crash_nlines; i++) {
+        loginui_text(cr, "Monospace 10", crash_lines[i],
+                     px + pad, ty, 0, 0.90, 0.90, 0.92);
+        ty += lh;
+    }
+}
+
 static void render_surface(struct wl_surface *surface, int w, int h) {
     cairo_t *cr;
     struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
@@ -227,6 +319,8 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
             loginui_text(cr, "Sans 12", power_labels[i], mx + 14, iy + (mh - 16) / 2.0, 0, 0.92, 0.92, 0.94);
         }
     }
+
+    draw_crash_panel(cr, w, h);
 
     cairo_destroy(cr);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
@@ -842,7 +936,25 @@ static const struct wl_registry_listener registry_listener = { reg_global, reg_r
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
+/* Startup phase timing. The greeter is the last thing between the boot splash
+ * and a usable login, so when it is slow the whole boot looks slow. Printing the
+ * elapsed time per phase is the only way to see which one costs, rather than
+ * guessing from the outside. */
+static double t_start_ms;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
+static void phase(const char *what) {
+    fprintf(stderr, "greeter: +%7.1fms %s\n", now_ms() - t_start_ms, what);
+}
+
 int main(int argc, char **argv) {
+    t_start_ms = now_ms();
+    phase("main entered");
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--preview") == 0) preview = true;
         if (strcmp(argv[i], "--recovery") == 0) recovery_mode = true;
@@ -853,19 +965,24 @@ int main(int argc, char **argv) {
      * otherwise auto-inits it on first use and fontconfig prints the "using
      * without calling FcInit()" warning to stderr on every launch. */
     FcInit();
+    phase("fontconfig ready");
 
     struct passwd *me = getpwuid(getuid());
     if (me && me->pw_name) snprintf(current_user, sizeof current_user, "%s", me->pw_name);
 
     load_users();
+    phase("users loaded");
     load_sessions();
+    phase("sessions loaded");
     find_os_logo();
+    phase("logo loaded");
 
     if (!preview && !recovery_mode && !greetd_connect()) {
         fprintf(stderr, "greeter: cannot connect to greetd ($GREETD_SOCK)\n");
         return 1;
     }
 
+    phase("greetd connected");
     display = wl_display_connect(NULL);
     if (!display) { fprintf(stderr, "greeter: cannot connect to Wayland display\n"); return 1; }
 
@@ -878,7 +995,9 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    phase("wayland globals bound");
     xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    phase("xkb ready");
 
     if (preview) {
         create_preview_window();
@@ -887,6 +1006,7 @@ int main(int argc, char **argv) {
     }
     wl_display_roundtrip(display);
 
+    phase("first surface committed");
     int wfd = wl_display_get_fd(display);
     int last_min = -1;
     while (running) {
