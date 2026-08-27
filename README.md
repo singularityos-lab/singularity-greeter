@@ -1,5 +1,9 @@
 # Singularity Greeter
 
+> [!IMPORTANT]
+> Report bugs and request features in the
+> [Singularity Desktop tracker](https://github.com/singularityos-lab/singularity-desktop/issues/new/choose).
+
 The login greeter for the Singularity Desktop, built on greetd and libsingularity.
 
 ## Requirements
