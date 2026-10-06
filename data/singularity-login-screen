@@ -1,0 +1,102 @@
+#!/bin/sh
+set -eu
+
+TARGET=/var/lib/singularity/login-screen/labwc
+BACKGROUND_DIR=/var/lib/singularity/login-screen
+MAX_BYTES=262144
+MAX_IMAGE_BYTES=26214400
+
+fail() {
+    echo "singularity-login-screen: $*" >&2
+    exit 1
+}
+
+case "${1:-}" in
+reset)
+    rm -rf "$TARGET"
+    exit 0
+    ;;
+apply)
+    ;;
+background-image)
+    umask 022
+    mkdir -p "$BACKGROUND_DIR"
+    tmp=$(mktemp "$BACKGROUND_DIR/.background.XXXXXX")
+    trap 'rm -f "$tmp"' EXIT
+    head -c "$((MAX_IMAGE_BYTES + 1))" > "$tmp"
+    size=$(wc -c < "$tmp")
+    [ "$size" -gt 0 ] || fail "no image received"
+    [ "$size" -le "$MAX_IMAGE_BYTES" ] || fail "the image is larger than 25 MB"
+    magic=$(head -c 12 "$tmp" | od -An -tx1 | tr -d ' \n')
+    case "$magic" in
+    89504e470d0a1a0a*|ffd8ff*|52494646????????57454250) : ;;
+    *) fail "only PNG, JPEG and WebP images are supported" ;;
+    esac
+    chmod 0644 "$tmp"
+    mv "$tmp" "$BACKGROUND_DIR/background"
+    rm -f "$BACKGROUND_DIR/background-color"
+    trap - EXIT
+    exit 0
+    ;;
+background-color)
+    color=$(head -c 16 | tr -d '\n')
+    printf '%s' "$color" | grep -qE '^#[0-9A-Fa-f]{6}$' || fail "invalid color"
+    umask 022
+    mkdir -p "$BACKGROUND_DIR"
+    printf '%s\n' "$color" > "$BACKGROUND_DIR/background-color"
+    rm -f "$BACKGROUND_DIR/background"
+    exit 0
+    ;;
+background-reset)
+    rm -f "$BACKGROUND_DIR/background" "$BACKGROUND_DIR/background-color"
+    exit 0
+    ;;
+*)
+    fail "usage: singularity-login-screen apply|reset|background-image|background-color|background-reset"
+    ;;
+esac
+
+umask 022
+parent=$(dirname "$TARGET")
+mkdir -p "$parent"
+work=$(mktemp -d "$parent/.login-screen.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+
+current=""
+head -c "$MAX_BYTES" | while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+    "%%FILE "*)
+        current=${line#%%FILE }
+        case "$current" in
+        rc.xml|output.xml|environment) : > "$work/$current" ;;
+        *) fail "unexpected file $current" ;;
+        esac
+        ;;
+    *)
+        [ -n "$current" ] || fail "data before the first file"
+        printf '%s\n' "$line" >> "$work/$current"
+        ;;
+    esac
+done
+
+for xml in rc.xml output.xml; do
+    [ -f "$work/$xml" ] || continue
+    if grep -qiE '<action|execute|<command' "$work/$xml"; then
+        fail "$xml may not contain actions"
+    fi
+    head -c 5 "$work/$xml" | grep -q '^<' || fail "$xml is not XML"
+done
+
+if [ -f "$work/environment" ]; then
+    if grep -vqE '^(XKB_[A-Z_]+|XCURSOR_(THEME|SIZE))=[A-Za-z0-9_.,:+-]*$' "$work/environment"; then
+        fail "environment may only set keyboard and cursor variables"
+    fi
+fi
+
+chmod 0755 "$work"
+find "$work" -type f -exec chmod 0644 {} +
+rm -rf "$TARGET.old"
+[ -d "$TARGET" ] && mv "$TARGET" "$TARGET.old"
+mv "$work" "$TARGET"
+trap - EXIT
+rm -rf "$TARGET.old"

@@ -17,6 +17,7 @@
 #include <sys/un.h>
 #include <sys/mman.h>
 #include <linux/input-event-codes.h>
+#include <utmp.h>
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -62,10 +63,17 @@ static int recovery_step = 0;      /* 0 = enter recovery code, 1 = enter new PIN
 static char recovery_code[256] = "";
 static bool status_error = false;
 static bool awaiting_auth = false;
+static bool auth_prompt_waiting = false;
+static bool auth_restart_pending = false;
 
 static int greetd_fd = -1;
 static bool preview = false;
 static bool running = true;
+static bool handoff = false;
+static double handoff_t0 = 0.0;
+static double handoff_s = 0.0;
+static double handoff_progress = 0.0;
+static cairo_surface_t *brand_logo = NULL;
 
 struct rect { double x, y, w, h; bool valid; };
 static struct rect user_hit[32];
@@ -84,6 +92,10 @@ struct g_output {
     struct zwlr_layer_surface_v1 *layer_surface;
     uint32_t width, height;
     bool configured;
+    struct wl_callback *frame_cb;
+    struct wl_surface *handoff_surface;
+    struct zwlr_layer_surface_v1 *handoff_layer;
+    bool handoff_presented;
     struct g_output *next;
 };
 
@@ -108,6 +120,9 @@ static struct xkb_keymap *xkb_keymap;
 static struct xkb_state *xkb_state;
 
 static void render_all(void);
+static void remember_login(void);
+static void begin_authentication(void);
+static void restart_authentication(void);
 
 /* ── chrome + render ────────────────────────────────────────────────────── */
 
@@ -214,6 +229,29 @@ static void draw_crash_panel(cairo_t *cr, int w, int h) {
         ty += lh;
     }
 }
+
+static double handoff_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void begin_handoff(void) {
+    handoff = true;
+    handoff_s = loginui_scene_seconds();
+    handoff_t0 = handoff_now();
+    handoff_progress = 0.0;
+    power_open = false;
+    render_all();
+}
+
+static void handoff_frame_done(void *data, struct wl_callback *cb, uint32_t time) {
+    (void)time;
+    struct wl_callback **slot = data;
+    wl_callback_destroy(cb);
+    *slot = NULL;
+}
+static const struct wl_callback_listener handoff_frame_listener = { .done = handoff_frame_done };
 
 static void render_surface(struct wl_surface *surface, int w, int h) {
     cairo_t *cr;
@@ -322,6 +360,14 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
 
     draw_crash_panel(cr, w, h);
 
+    if (handoff) {
+        cairo_push_group(cr);
+        loginui_render_brand(cr, w, h, brand_logo, 0.0, 0.0);
+        cairo_pop_group_to_source(cr);
+        if (handoff_progress >= 1.0) cairo_paint(cr);
+        else cairo_paint_with_alpha(cr, handoff_progress);
+    }
+
     cairo_destroy(cr);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface, 0, 0, w, h);
@@ -333,8 +379,38 @@ static void render_all(void) {
         if (pv_configured) render_surface(pv_surface, pv_w, pv_h);
         return;
     }
+    for (struct g_output *o = outputs; o; o = o->next) {
+        if (!o->configured) continue;
+        if (handoff) {
+            if (o->frame_cb) continue;
+            o->frame_cb = wl_surface_frame(o->surface);
+            wl_callback_add_listener(o->frame_cb, &handoff_frame_listener, &o->frame_cb);
+        }
+        render_surface(o->surface, (int)o->width, (int)o->height);
+    }
+}
+
+static bool handoff_surfaces_created = false;
+static void create_handoff_surfaces(void);
+
+static bool handoff_tick(void) {
+    if (!handoff) return false;
+    if (handoff_surfaces_created) {
+        for (struct g_output *o = outputs; o; o = o->next)
+            if (o->handoff_layer && !o->handoff_presented) return false;
+        return true;
+    }
+    bool presented = handoff_progress >= 1.0;
     for (struct g_output *o = outputs; o; o = o->next)
-        if (o->configured) render_surface(o->surface, (int)o->width, (int)o->height);
+        if (o->frame_cb) presented = false;
+    if (presented) {
+        create_handoff_surfaces();
+        return false;
+    }
+    double p = handoff_s > 0.0 ? (handoff_now() - handoff_t0) / handoff_s : 1.0;
+    handoff_progress = p >= 1.0 ? 1.0 : (p < 0.0 ? 0.0 : p);
+    render_all();
+    return false;
 }
 
 /* ── greetd IPC ─────────────────────────────────────────────────────────── */
@@ -386,6 +462,29 @@ static void greetd_cancel_session(void) {
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "type"); json_builder_add_string_value(b, "cancel_session");
     greetd_send_object(b);
+}
+
+static void begin_authentication(void) {
+    if (preview || recovery_mode || n_users == 0 || greetd_fd < 0 || awaiting_auth) return;
+    awaiting_auth = true;
+    auth_prompt_waiting = false;
+    auth_restart_pending = false;
+    pending_password[0] = '\0';
+    if (status_text[0] == '\0')
+        snprintf(status_text, sizeof status_text, "%s", "Touch the fingerprint sensor or enter your password");
+    status_error = false;
+    greetd_create_session(users[sel_user].username);
+}
+
+static void restart_authentication(void) {
+    auth_prompt_waiting = false;
+    pending_password[0] = '\0';
+    if (awaiting_auth) {
+        auth_restart_pending = true;
+        greetd_cancel_session();
+        return;
+    }
+    begin_authentication();
 }
 
 static void greetd_start_session(const char *exec) {
@@ -444,6 +543,7 @@ static void run_recover(const char *code, const char *newpin) {
         snprintf(status_text, sizeof status_text, "PIN reset. Log in with your new PIN.");
         status_error = false;
         recovery_mode = false; recovery_step = 0; /* back to the normal login, same session */
+        restart_authentication();
     } else if (n > 0 && strncmp(resp, "BLOCKED", 7) == 0) {
         snprintf(status_text, sizeof status_text, "Too many attempts. Try again later.");
         status_error = true; recovery_step = 0;
@@ -474,16 +574,22 @@ static void submit_password(void) {
     if (password_len == 0) return;
     if (recovery_mode) { submit_recovery(); return; }
     if (n_users == 0) return;
+    if (!awaiting_auth) begin_authentication();
     g_strlcpy(pending_password, password, sizeof pending_password);
     memset(password, 0, sizeof password);
     password_len = 0;
-    snprintf(status_text, sizeof status_text, "%s", "Authenticating…");
+    if (auth_prompt_waiting) {
+        greetd_post_response(pending_password);
+        pending_password[0] = '\0';
+        auth_prompt_waiting = false;
+        snprintf(status_text, sizeof status_text, "%s", "Authenticating...");
+    } else {
+        snprintf(status_text, sizeof status_text, "%s", "Waiting for fingerprint or password prompt");
+    }
     status_error = false;
     render_all();
     wl_display_flush(display);
     if (preview) { snprintf(status_text, sizeof status_text, "Preview"); render_all(); return; }
-    awaiting_auth = true;
-    greetd_create_session(users[sel_user].username);
 }
 
 static void greetd_handle(void) {
@@ -512,26 +618,49 @@ static void greetd_handle(void) {
                     status_error = (g_strcmp0(amt, "error") == 0);
                     render_all();
                 } else {
-                    greetd_post_response(pending_password);
-                    memset(pending_password, 0, sizeof pending_password);
+                    const char *m = json_object_has_member(root, "auth_message")
+                        ? json_object_get_string_member(root, "auth_message") : "Password";
+                    if (pending_password[0] != '\0') {
+                        greetd_post_response(pending_password);
+                        pending_password[0] = '\0';
+                        auth_prompt_waiting = false;
+                        snprintf(status_text, sizeof status_text, "%s", "Authenticating...");
+                    } else {
+                        auth_prompt_waiting = true;
+                        snprintf(status_text, sizeof status_text, "%s", m);
+                    }
+                    status_error = false;
+                    render_all();
                 }
             } else if (g_strcmp0(type, "success") == 0) {
                 if (awaiting_auth) {
                     awaiting_auth = false;
+                    auth_prompt_waiting = false;
+                    remember_login();
                     if (n_sessions > 0) greetd_start_session(sessions[sel_session].exec);
                     wl_display_flush(display);
-                    running = false;
+                    if (preview || outputs == NULL) running = false;
+                    else begin_handoff();
                 }
             } else if (g_strcmp0(type, "error") == 0) {
                 const char *desc = json_object_has_member(root, "description")
                     ? json_object_get_string_member(root, "description") : "Authentication failed";
-                snprintf(status_text, sizeof status_text, "%s", desc);
-                status_error = true;
+                bool was_authenticating = awaiting_auth;
+                bool requested_restart = auth_restart_pending;
                 awaiting_auth = false;
-                greetd_cancel_session();
+                auth_prompt_waiting = false;
+                auth_restart_pending = false;
                 memset(password, 0, sizeof password);
                 memset(pending_password, 0, sizeof pending_password);
                 password_len = 0;
+                if (requested_restart) {
+                    status_text[0] = '\0';
+                    status_error = false;
+                } else {
+                    snprintf(status_text, sizeof status_text, "%s", desc);
+                    status_error = true;
+                }
+                if (was_authenticating && !recovery_mode) begin_authentication();
                 render_all();
             }
         }
@@ -572,8 +701,32 @@ static void power_action(int which) {
 
 /* ── users / sessions / assets ──────────────────────────────────────────── */
 
+static cairo_surface_t *load_login_screen_bg(void) {
+    const char *dir = "/var/lib/singularity/login-screen";
+    char path[256];
+    snprintf(path, sizeof path, "%s/background-color", dir);
+    char *text = NULL;
+    if (g_file_get_contents(path, &text, NULL, NULL)) {
+        unsigned int r = 0, g = 0, b = 0;
+        int ok = sscanf(g_strstrip(text), "#%02x%02x%02x", &r, &g, &b) == 3;
+        g_free(text);
+        if (ok) {
+            cairo_surface_t *solid = cairo_image_surface_create(CAIRO_FORMAT_RGB24, 16, 16);
+            cairo_t *cr = cairo_create(solid);
+            cairo_set_source_rgb(cr, r / 255.0, g / 255.0, b / 255.0);
+            cairo_paint(cr);
+            cairo_destroy(cr);
+            return solid;
+        }
+    }
+    snprintf(path, sizeof path, "%s/background", dir);
+    if (access(path, R_OK) == 0) return loginui_load_wallpaper(path, 960);
+    return NULL;
+}
+
 static cairo_surface_t *load_user_bg(const char *user) {
-    cairo_surface_t *bg = NULL;
+    cairo_surface_t *bg = load_login_screen_bg();
+    if (bg) return bg;
 
     char acc[600];
     snprintf(acc, sizeof acc, "/var/lib/AccountsService/users/%s", user);
@@ -672,6 +825,117 @@ static void load_sessions(void) {
     }
 }
 
+static char *state_path(void) {
+    return g_build_filename(g_get_user_state_dir(), "singularity-greeter", "state", NULL);
+}
+
+static int find_user(const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < n_users; i++)
+        if (strcmp(users[i].username, name) == 0) return i;
+    return -1;
+}
+
+static int find_session(const char *name) {
+    if (!name || !name[0]) return -1;
+    for (int i = 0; i < n_sessions; i++)
+        if (strcmp(sessions[i].name, name) == 0) return i;
+    return -1;
+}
+
+static GSettings *greeter_settings(void) {
+    GSettingsSchemaSource *src = g_settings_schema_source_get_default();
+    GSettingsSchema *schema = src ? g_settings_schema_source_lookup(src, "dev.sinty.greeter", TRUE) : NULL;
+    if (!schema) return NULL;
+    gboolean has_key = g_settings_schema_has_key(schema, "last-user");
+    g_settings_schema_unref(schema);
+    return has_key ? g_settings_new("dev.sinty.greeter") : NULL;
+}
+
+static int wtmp_last_user(void) {
+    int found = -1;
+    int64_t newest = -1;
+    utmpname(_PATH_WTMP);
+    setutent();
+    struct utmp *entry;
+    while ((entry = getutent()) != NULL) {
+        if (entry->ut_type != USER_PROCESS) continue;
+        char name[sizeof entry->ut_user + 1];
+        memcpy(name, entry->ut_user, sizeof entry->ut_user);
+        name[sizeof entry->ut_user] = '\0';
+        int index = find_user(name);
+        if (index < 0 || (int64_t)entry->ut_tv.tv_sec < newest) continue;
+        newest = entry->ut_tv.tv_sec;
+        found = index;
+    }
+    endutent();
+    return found;
+}
+
+static void restore_session_for_user(void) {
+    char *path = state_path();
+    GKeyFile *kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        char *name = g_key_file_get_string(kf, "sessions", users[sel_user].username, NULL);
+        int index = find_session(name);
+        if (index >= 0) sel_session = index;
+        g_free(name);
+    }
+    g_key_file_free(kf);
+    g_free(path);
+}
+
+static void restore_last_user(void) {
+    if (n_users == 0) return;
+    int index = -1;
+    char *path = state_path();
+    GKeyFile *kf = g_key_file_new();
+    if (g_key_file_load_from_file(kf, path, G_KEY_FILE_NONE, NULL)) {
+        char *name = g_key_file_get_string(kf, "greeter", "last-user", NULL);
+        index = find_user(name);
+        g_free(name);
+    }
+    g_key_file_free(kf);
+    g_free(path);
+
+    if (index < 0) {
+        GSettings *settings = greeter_settings();
+        if (settings) {
+            char *name = g_settings_get_string(settings, "last-user");
+            index = find_user(name);
+            g_free(name);
+            g_object_unref(settings);
+        }
+    }
+    if (index < 0) index = wtmp_last_user();
+    sel_user = index >= 0 ? index : 0;
+    restore_session_for_user();
+}
+
+static void remember_login(void) {
+    if (n_users == 0) return;
+    const char *user = users[sel_user].username;
+    char *path = state_path();
+    char *dir = g_path_get_dirname(path);
+    g_mkdir_with_parents(dir, 0700);
+    GKeyFile *kf = g_key_file_new();
+    g_key_file_load_from_file(kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL);
+    g_key_file_set_string(kf, "greeter", "last-user", user);
+    if (n_sessions > 0) g_key_file_set_string(kf, "sessions", user, sessions[sel_session].name);
+    if (!g_key_file_save_to_file(kf, path, NULL))
+        fprintf(stderr, "greeter: cannot remember the last user in %s\n", path);
+    g_key_file_free(kf);
+    g_free(dir);
+    g_free(path);
+
+    GSettings *settings = greeter_settings();
+    if (settings) {
+        g_settings_set_string(settings, "last-user", user);
+        g_settings_sync();
+        g_object_unref(settings);
+    }
+}
+
 static bool try_logo_file(const char *name) {
     if (!name || !name[0]) return false;
     const char *tpl[] = {
@@ -734,7 +998,7 @@ static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, w
 }
 static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time,
                       uint32_t button, uint32_t state) {
-    if (button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return;
+    if (handoff || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return;
     if (power_open) {
         for (int i = 0; i < 3; i++) if (in_rect(&power_item[i])) { power_open = false; power_action(i); render_all(); return; }
         if (!in_rect(&power_hit)) { power_open = false; render_all(); return; }
@@ -742,7 +1006,7 @@ static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t t
     if (in_rect(&power_hit)) { power_open = !power_open; render_all(); return; }
     if (in_rect(&session_hit) && n_sessions > 1) { sel_session = (sel_session + 1) % n_sessions; render_all(); return; }
     for (int i = 0; i < n_users; i++) if (in_rect(&user_hit[i])) {
-        sel_user = i; status_text[0] = '\0'; memset(password, 0, sizeof password); password_len = 0; render_all(); return;
+        sel_user = i; restore_session_for_user(); status_text[0] = '\0'; memset(password, 0, sizeof password); password_len = 0; restart_authentication(); render_all(); return;
     }
 }
 static void pt_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) {}
@@ -780,7 +1044,7 @@ static void kb_repeat(void *d, struct wl_keyboard *kb, int32_t rate, int32_t del
 
 static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
                    uint32_t time, uint32_t key, uint32_t state) {
-    if (!xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+    if (handoff || !xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
     xkb_keycode_t kc = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, kc);
 
@@ -795,13 +1059,13 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         render_all();
         return;
     case XKB_KEY_Escape:
-        if (recovery_mode) { recovery_mode = false; recovery_step = 0; }
+        if (recovery_mode) { recovery_mode = false; recovery_step = 0; restart_authentication(); }
         memset(password, 0, sizeof password); password_len = 0; status_text[0] = '\0';
         power_open = false;
         render_all();
         return;
     case XKB_KEY_Tab:
-        if (n_users > 1) { sel_user = (sel_user + 1) % n_users; memset(password, 0, sizeof password); password_len = 0; status_text[0] = '\0'; render_all(); }
+        if (n_users > 1) { sel_user = (sel_user + 1) % n_users; restore_session_for_user(); memset(password, 0, sizeof password); password_len = 0; status_text[0] = '\0'; restart_authentication(); render_all(); }
         return;
     case XKB_KEY_F1:
         /* Forgot PIN? Enter the in-process recovery mode (the greeter stays unprivileged;
@@ -809,6 +1073,8 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         if (!recovery_mode && auth_is_pin) {
             recovery_mode = true;
             recovery_step = 0;
+            auth_restart_pending = false;
+            if (awaiting_auth) greetd_cancel_session();
             memset(password, 0, sizeof password); password_len = 0;
             status_text[0] = '\0'; status_error = false;
             render_all();
@@ -861,6 +1127,54 @@ static void create_layer_surface(struct g_output *o) {
     wl_surface_commit(o->surface);
 }
 
+static void handoff_presented(void *data, struct wl_callback *cb, uint32_t time) {
+    (void)time;
+    struct g_output *o = data;
+    wl_callback_destroy(cb);
+    o->handoff_presented = true;
+}
+static const struct wl_callback_listener handoff_presented_listener = { .done = handoff_presented };
+
+static void handoff_configure(void *data, struct zwlr_layer_surface_v1 *ls,
+                              uint32_t serial, uint32_t w, uint32_t h) {
+    struct g_output *o = data;
+    zwlr_layer_surface_v1_ack_configure(ls, serial);
+    cairo_t *cr;
+    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    if (!b) { o->handoff_presented = true; return; }
+    loginui_render_brand(cr, (int)w, (int)h, brand_logo, 0.0, 0.0);
+    cairo_destroy(cr);
+    struct wl_callback *cb = wl_surface_frame(o->handoff_surface);
+    wl_callback_add_listener(cb, &handoff_presented_listener, o);
+    wl_surface_attach(o->handoff_surface, b->wl_buffer, 0, 0);
+    wl_surface_damage_buffer(o->handoff_surface, 0, 0, w, h);
+    wl_surface_commit(o->handoff_surface);
+}
+static void handoff_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
+    struct g_output *o = data;
+    o->handoff_presented = true;
+}
+static const struct zwlr_layer_surface_v1_listener handoff_layer_listener = {
+    .configure = handoff_configure, .closed = handoff_closed,
+};
+
+static void create_handoff_surfaces(void) {
+    handoff_surfaces_created = true;
+    for (struct g_output *o = outputs; o; o = o->next) {
+        if (!o->configured || !layer_shell) continue;
+        o->handoff_surface = wl_compositor_create_surface(compositor);
+        o->handoff_layer = zwlr_layer_shell_v1_get_layer_surface(
+            layer_shell, o->handoff_surface, o->wl_output,
+            ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "singularity-handoff");
+        zwlr_layer_surface_v1_set_anchor(o->handoff_layer,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+        zwlr_layer_surface_v1_set_exclusive_zone(o->handoff_layer, -1);
+        zwlr_layer_surface_v1_add_listener(o->handoff_layer, &handoff_layer_listener, o);
+        wl_surface_commit(o->handoff_surface);
+    }
+}
+
 static void xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial) {
     xdg_surface_ack_configure(xs, serial);
     pv_configured = true;
@@ -892,6 +1206,32 @@ static void create_preview_window(void) {
 
 /* ── registry ───────────────────────────────────────────────────────────── */
 
+static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
+    (void)data;
+    bool has_keyboard = (caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
+    bool has_pointer = (caps & WL_SEAT_CAPABILITY_POINTER) != 0;
+    if (has_keyboard && !keyboard) {
+        keyboard = wl_seat_get_keyboard(s);
+        wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
+    } else if (!has_keyboard && keyboard) {
+        wl_keyboard_release(keyboard);
+        keyboard = NULL;
+    }
+    if (has_pointer && !pointer) {
+        pointer = wl_seat_get_pointer(s);
+        wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    } else if (!has_pointer && pointer) {
+        wl_pointer_release(pointer);
+        pointer = NULL;
+    }
+}
+
+static void seat_name(void *data, struct wl_seat *s, const char *name) {
+    (void)data; (void)s; (void)name;
+}
+
+static const struct wl_seat_listener seat_listener = { seat_capabilities, seat_name };
+
 static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
                        const char *iface, uint32_t version) {
     if (strcmp(iface, wl_compositor_interface.name) == 0) {
@@ -905,10 +1245,7 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
         xdg_wm_base_add_listener(wm_base, &wm_base_listener, NULL);
     } else if (strcmp(iface, wl_seat_interface.name) == 0) {
         seat = wl_registry_bind(reg, name, &wl_seat_interface, version < 5 ? version : 5);
-        keyboard = wl_seat_get_keyboard(seat);
-        if (keyboard) wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
-        pointer = wl_seat_get_pointer(seat);
-        if (pointer) wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+        wl_seat_add_listener(seat, &seat_listener, NULL);
     } else if (strcmp(iface, wl_output_interface.name) == 0) {
         struct g_output *o = calloc(1, sizeof(*o));
         o->name = name;
@@ -974,7 +1311,10 @@ int main(int argc, char **argv) {
     phase("users loaded");
     load_sessions();
     phase("sessions loaded");
+    restore_last_user();
+    phase("last user restored");
     find_os_logo();
+    brand_logo = loginui_load_brand_logo();
     phase("logo loaded");
 
     if (!preview && !recovery_mode && !greetd_connect()) {
@@ -1007,6 +1347,7 @@ int main(int argc, char **argv) {
     wl_display_roundtrip(display);
 
     phase("first surface committed");
+    begin_authentication();
     int wfd = wl_display_get_fd(display);
     int last_min = -1;
     while (running) {
@@ -1016,15 +1357,17 @@ int main(int argc, char **argv) {
 
         struct pollfd pfds[2];
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
-        pfds[1].fd = greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
+        pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, 1000);
+        int pr = poll(pfds, 2, handoff ? 100 : 1000);
 
         if (pr > 0 && (pfds[0].revents & POLLIN)) wl_display_read_events(display);
         else wl_display_cancel_read(display);
         wl_display_dispatch_pending(display);
 
-        if (greetd_fd >= 0 && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
+        if (greetd_fd >= 0 && !handoff && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
+        if (handoff_tick()) { running = false; break; }
+        if (handoff) continue;
 
         time_t now = time(NULL);
         struct tm tm; localtime_r(&now, &tm);

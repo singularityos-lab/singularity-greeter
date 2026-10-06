@@ -43,3 +43,17 @@ executable('singularity-greeter',
 install_data('data/dev.sinty.greeter.gschema.xml',
   install_dir: get_option('datadir') / 'glib-2.0' / 'schemas'
 )
+
+install_data('data/singularity-login-screen',
+  install_dir: get_option('libexecdir'),
+  install_mode: 'rwxr-xr-x',
+)
+
+policy_conf = configuration_data()
+policy_conf.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
+configure_file(
+  input: 'data/dev.sinty.greeter.login-screen.policy',
+  output: 'dev.sinty.greeter.login-screen.policy',
+  configuration: policy_conf,
+  install_dir: get_option('datadir') / 'polkit-1' / 'actions',
+)
