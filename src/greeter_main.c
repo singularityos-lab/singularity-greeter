@@ -92,6 +92,7 @@ struct g_output {
     struct wl_surface *surface;
     struct zwlr_layer_surface_v1 *layer_surface;
     uint32_t width, height;
+    int32_t scale, pending_scale;
     bool configured;
     struct wl_callback *frame_cb;
     struct wl_surface *handoff_surface;
@@ -254,10 +255,13 @@ static void handoff_frame_done(void *data, struct wl_callback *cb, uint32_t time
 }
 static const struct wl_callback_listener handoff_frame_listener = { .done = handoff_frame_done };
 
-static void render_surface(struct wl_surface *surface, int w, int h) {
+static void render_surface(struct wl_surface *surface, int w, int h, int32_t sc) {
+    if (sc < 1) sc = 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, (uint32_t)w * (uint32_t)sc,
+                                                     (uint32_t)h * (uint32_t)sc, &cr);
     if (!b) return;
+    cairo_scale(cr, sc, sc);
 
     struct g_user *u = (n_users > 0) ? &users[sel_user] : NULL;
 
@@ -370,14 +374,15 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     }
 
     cairo_destroy(cr);
+    wl_surface_set_buffer_scale(surface, sc);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(surface, 0, 0, w, h);
+    wl_surface_damage_buffer(surface, 0, 0, w * sc, h * sc);
     wl_surface_commit(surface);
 }
 
 static void render_all(void) {
     if (preview) {
-        if (pv_configured) render_surface(pv_surface, pv_w, pv_h);
+        if (pv_configured) render_surface(pv_surface, pv_w, pv_h, 1);
         return;
     }
     for (struct g_output *o = outputs; o; o = o->next) {
@@ -387,7 +392,7 @@ static void render_all(void) {
             o->frame_cb = wl_surface_frame(o->surface);
             wl_callback_add_listener(o->frame_cb, &handoff_frame_listener, &o->frame_cb);
         }
-        render_surface(o->surface, (int)o->width, (int)o->height);
+        render_surface(o->surface, (int)o->width, (int)o->height, o->scale);
     }
 }
 
@@ -1114,12 +1119,38 @@ static const struct wl_keyboard_listener keyboard_listener = {
 
 /* ── surfaces ───────────────────────────────────────────────────────────── */
 
+static void output_geometry(void *data, struct wl_output *wo, int32_t x, int32_t y,
+                            int32_t pw, int32_t ph, int32_t subpixel, const char *make,
+                            const char *model, int32_t transform) {}
+
+static void output_mode(void *data, struct wl_output *wo, uint32_t flags,
+                        int32_t w, int32_t h, int32_t refresh) {}
+
+static void output_scale(void *data, struct wl_output *wo, int32_t factor) {
+    struct g_output *o = data;
+    if (factor > 0) o->pending_scale = factor;
+}
+
+static void output_done(void *data, struct wl_output *wo) {
+    struct g_output *o = data;
+    if (o->pending_scale <= 0 || o->pending_scale == o->scale) return;
+    o->scale = o->pending_scale;
+    if (o->configured) render_all();
+}
+
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done,
+    .scale = output_scale,
+};
+
 static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
                             uint32_t serial, uint32_t w, uint32_t h) {
     struct g_output *o = data;
     o->width = w; o->height = h; o->configured = true;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
-    render_surface(o->surface, (int)w, (int)h);
+    render_surface(o->surface, (int)w, (int)h, o->scale);
 }
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls) { running = false; }
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
@@ -1153,15 +1184,18 @@ static void handoff_configure(void *data, struct zwlr_layer_surface_v1 *ls,
                               uint32_t serial, uint32_t w, uint32_t h) {
     struct g_output *o = data;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
+    int32_t sc = o->scale > 0 ? o->scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, w * (uint32_t)sc, h * (uint32_t)sc, &cr);
     if (!b) { o->handoff_presented = true; return; }
+    cairo_scale(cr, sc, sc);
     loginui_render_brand(cr, (int)w, (int)h, brand_logo, 0.0, 0.0);
     cairo_destroy(cr);
     struct wl_callback *cb = wl_surface_frame(o->handoff_surface);
     wl_callback_add_listener(cb, &handoff_presented_listener, o);
+    wl_surface_set_buffer_scale(o->handoff_surface, sc);
     wl_surface_attach(o->handoff_surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(o->handoff_surface, 0, 0, w, h);
+    wl_surface_damage_buffer(o->handoff_surface, 0, 0, (int)(w * (uint32_t)sc), (int)(h * (uint32_t)sc));
     wl_surface_commit(o->handoff_surface);
 }
 static void handoff_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
@@ -1192,7 +1226,7 @@ static void create_handoff_surfaces(void) {
 static void xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial) {
     xdg_surface_ack_configure(xs, serial);
     pv_configured = true;
-    render_surface(pv_surface, pv_w, pv_h);
+    render_surface(pv_surface, pv_w, pv_h, 1);
 }
 static const struct xdg_surface_listener xdg_surface_listener = { .configure = xdg_surface_configure };
 
@@ -1264,6 +1298,7 @@ static void reg_global(void *data, struct wl_registry *reg, uint32_t name,
         struct g_output *o = calloc(1, sizeof(*o));
         o->name = name;
         o->wl_output = wl_registry_bind(reg, name, &wl_output_interface, version < 3 ? version : 3);
+        wl_output_add_listener(o->wl_output, &output_listener, o);
         o->next = outputs;
         outputs = o;
     }
