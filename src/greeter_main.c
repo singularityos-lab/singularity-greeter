@@ -631,6 +631,7 @@ static void greetd_handle(void) {
                         ? json_object_get_string_member(root, "auth_message") : "";
                     snprintf(status_text, sizeof status_text, "%s", m);
                     status_error = (g_strcmp0(amt, "error") == 0);
+                    greetd_post_response(NULL);
                     render_all();
                 } else {
                     const char *m = json_object_has_member(root, "auth_message")
