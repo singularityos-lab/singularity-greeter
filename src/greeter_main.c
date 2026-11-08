@@ -123,6 +123,7 @@ static struct xkb_keymap *xkb_keymap;
 static struct xkb_state *xkb_state;
 
 static void render_all(void);
+static bool sinty_guest(void);
 static void remember_login(void);
 static void begin_authentication(void);
 static void restart_authentication(void);
@@ -278,7 +279,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     st.avatar = u ? u->avatar : NULL;
     st.background = u ? u->bg : NULL;
     st.password_dots = (int)password_len;
-    st.status_text = status_text[0] ? status_text : NULL;
+    st.status_text = status_text[0] ? status_text : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : NULL);
     st.status_error = status_error;
     if (recovery_mode)
         st.auth_label = recovery_step == 0 ? "Recovery code" : (auth_has_tpm ? "New PIN" : "New passphrase");
@@ -479,6 +480,25 @@ static void greetd_cancel_session(void) {
     greetd_send_object(b);
 }
 
+static bool sinty_guest(void) {
+    return g_file_test("/run/sinty-key/guest", G_FILE_TEST_EXISTS);
+}
+
+static bool sinty_wait_text(char *out, size_t n) {
+    struct passwd *pw = (n_users > 0) ? getpwnam(users[sel_user].username) : NULL;
+    if (!pw) return false;
+    char path[64], *data = NULL;
+    snprintf(path, sizeof path, "/run/sinty-key/wait-%u", (unsigned)pw->pw_uid);
+    if (!g_file_get_contents(path, &data, NULL, NULL)) return false;
+    long long until = g_ascii_strtoll(data, NULL, 10);
+    g_free(data);
+    long long left = until - (long long)time(NULL);
+    if (left <= 0) return false;
+    if (left < 120) snprintf(out, n, "Too many attempts. Try again in %lld seconds.", left);
+    else snprintf(out, n, "Too many attempts. Try again in %lld minutes.", (left + 59) / 60);
+    return true;
+}
+
 static void begin_authentication(void) {
     if (preview || recovery_mode || n_users == 0 || greetd_fd < 0 || awaiting_auth) return;
     awaiting_auth = true;
@@ -673,7 +693,8 @@ static void greetd_handle(void) {
                     status_text[0] = '\0';
                     status_error = false;
                 } else {
-                    snprintf(status_text, sizeof status_text, "%s", desc);
+                    if (!sinty_wait_text(status_text, sizeof status_text))
+                        snprintf(status_text, sizeof status_text, "%s", desc);
                     status_error = true;
                 }
                 if (was_authenticating && !recovery_mode) begin_authentication();
