@@ -695,9 +695,12 @@ static void greetd_handle(void) {
                     status_text[0] = '\0';
                     status_error = false;
                 } else {
+                    const char *etype = json_object_has_member(root, "error_type")
+                        ? json_object_get_string_member(root, "error_type") : "";
+                    bool wrong = g_strcmp0(etype, "auth_error") == 0 || g_str_has_prefix(desc, "pam_");
                     if (!sinty_wait_text(status_text, sizeof status_text))
-                        snprintf(status_text, sizeof status_text, g_str_has_prefix(desc, "pam_") ? "Incorrect %s" : "%s",
-                            g_str_has_prefix(desc, "pam_") ? (auth_is_pin ? (auth_has_tpm ? "PIN" : "passphrase") : "password") : desc);
+                        snprintf(status_text, sizeof status_text, wrong ? "Incorrect %s" : "%s",
+                            wrong ? (auth_is_pin ? (auth_has_tpm ? "PIN" : "passphrase") : "password") : desc);
                     status_error = true;
                 }
                 bool failed = status_error;
