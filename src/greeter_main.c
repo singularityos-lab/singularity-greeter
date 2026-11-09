@@ -127,6 +127,9 @@ static bool sinty_guest(void);
 static void remember_login(void);
 static void begin_authentication(void);
 static void restart_authentication(void);
+static const char *key_text(void);
+static void keyd_attach(const char *username);
+static char key_pin[1024];
 
 /* ── chrome + render ────────────────────────────────────────────────────── */
 
@@ -279,7 +282,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     st.avatar = u ? u->avatar : NULL;
     st.background = u ? u->bg : NULL;
     st.password_dots = (int)password_len;
-    st.status_text = status_text[0] ? status_text : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : NULL);
+    st.status_text = status_text[0] ? status_text : key_text() ? key_text() : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : NULL);
     st.status_error = status_error;
     if (recovery_mode)
         st.auth_label = recovery_step == 0 ? "Recovery code" : (auth_has_tpm ? "New PIN" : "New passphrase");
@@ -468,6 +471,7 @@ static void greetd_post_response(const char *response) {
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "type"); json_builder_add_string_value(b, "post_auth_message_response");
     json_builder_set_member_name(b, "response");
+    if (response) g_strlcpy(key_pin, response, sizeof key_pin);
     if (response) json_builder_add_string_value(b, response);
     else json_builder_add_null_value(b);
     greetd_send_object(b);
@@ -675,6 +679,7 @@ static void greetd_handle(void) {
                     awaiting_auth = false;
                     auth_prompt_waiting = false;
                     remember_login();
+                    keyd_attach(users[sel_user].username);
                     if (n_sessions > 0) greetd_start_session(sessions[sel_session].exec);
                     wl_display_flush(display);
                     if (preview || outputs == NULL) running = false;
@@ -690,6 +695,7 @@ static void greetd_handle(void) {
                 auth_restart_pending = false;
                 memset(password, 0, sizeof password);
                 memset(pending_password, 0, sizeof pending_password);
+                memset(key_pin, 0, sizeof key_pin);
                 password_len = 0;
                 if (requested_restart) {
                     status_text[0] = '\0';
@@ -1353,6 +1359,72 @@ static void phase(const char *what) {
     fprintf(stderr, "greeter: +%7.1fms %s\n", now_ms() - t_start_ms, what);
 }
 
+static GDBusProxy *keyd;
+static char key_device[64], key_owner[64], key_state[16];
+
+static bool key_for_selected(void) {
+    if (!key_device[0] || n_users == 0) return false;
+    return !key_owner[0] || strcmp(key_owner, users[sel_user].username) == 0;
+}
+
+static const char *key_text(void) {
+    if (!key_for_selected()) return NULL;
+    if (strcmp(key_state, "copy") == 0) return "This Sinty Key is an older copy. Open it with the recovery code.";
+    if (strcmp(key_state, "locked") == 0) return "Sinty Key connected. It opens with your PIN.";
+    return "Sinty Key open";
+}
+
+static void keyd_refresh(void) {
+    key_device[0] = key_owner[0] = key_state[0] = '\0';
+    GVariant *v = keyd ? g_dbus_proxy_get_cached_property(keyd, "Present") : NULL;
+    if (v && g_variant_is_of_type(v, G_VARIANT_TYPE("a(ssss)"))) {
+        GVariantIter it;
+        const char *dev, *id, *owner, *state;
+        g_variant_iter_init(&it, v);
+        while (g_variant_iter_next(&it, "(&s&s&s&s)", &dev, &id, &owner, &state)) {
+            if (key_device[0] && find_user(key_owner) >= 0) break;
+            g_strlcpy(key_device, dev, sizeof key_device);
+            g_strlcpy(key_owner, owner, sizeof key_owner);
+            g_strlcpy(key_state, state, sizeof key_state);
+        }
+    }
+    if (v) g_variant_unref(v);
+    int i = key_owner[0] ? find_user(key_owner) : -1;
+    if (i >= 0 && i != sel_user && password_len == 0 && !recovery_mode && !awaiting_auth) {
+        sel_user = i;
+        restore_session_for_user();
+        status_text[0] = '\0';
+        restart_authentication();
+    }
+    render_all();
+}
+
+static void keyd_changed(GDBusProxy *proxy, GVariant *changed, GStrv invalidated, gpointer data) {
+    keyd_refresh();
+}
+
+static void keyd_owner_changed(GObject *proxy, GParamSpec *pspec, gpointer data) {
+    keyd_refresh();
+}
+
+static void keyd_ready(GObject *source, GAsyncResult *res, gpointer data) {
+    keyd = g_dbus_proxy_new_for_bus_finish(res, NULL);
+    if (!keyd) return;
+    g_signal_connect(keyd, "g-properties-changed", G_CALLBACK(keyd_changed), NULL);
+    g_signal_connect(keyd, "notify::g-name-owner", G_CALLBACK(keyd_owner_changed), NULL);
+    keyd_refresh();
+}
+
+static void keyd_attach(const char *username) {
+    if (keyd && key_pin[0] && key_device[0] && strcmp(key_state, "locked") == 0 &&
+        (!key_owner[0] || strcmp(key_owner, username) == 0)) {
+        g_dbus_proxy_call(keyd, "Attach", g_variant_new("(sss)", key_device, username, key_pin),
+                          G_DBUS_CALL_FLAGS_NONE, 20000, NULL, NULL, NULL);
+        g_dbus_connection_flush_sync(g_dbus_proxy_get_connection(keyd), NULL, NULL);
+    }
+    memset(key_pin, 0, sizeof key_pin);
+}
+
 int main(int argc, char **argv) {
     t_start_ms = now_ms();
     phase("main entered");
@@ -1377,6 +1449,8 @@ int main(int argc, char **argv) {
     phase("sessions loaded");
     restore_last_user();
     phase("last user restored");
+    g_dbus_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE, NULL, "dev.sinty.Key1", "/dev/sinty/Key1",
+                             "dev.sinty.Key1", NULL, keyd_ready, NULL);
     find_os_logo();
     brand_logo = loginui_load_brand_logo();
     phase("logo loaded");
@@ -1444,6 +1518,7 @@ int main(int argc, char **argv) {
         }
 
         if (greetd_fd >= 0 && !handoff && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
+        while (g_main_context_iteration(NULL, FALSE));
         if (handoff_tick()) { running = false; break; }
         if (handoff) continue;
 
