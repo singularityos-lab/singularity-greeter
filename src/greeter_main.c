@@ -484,6 +484,16 @@ static void greetd_cancel_session(void) {
     greetd_send_object(b);
 }
 
+static bool sinty_tier_tpm(void) {
+    char *tier = NULL;
+    if (g_file_get_contents("/run/sinty-key/tier", &tier, NULL, NULL)) {
+        bool tpm = g_str_has_prefix(tier, "tpm");
+        g_free(tier);
+        return tpm;
+    }
+    return g_file_test("/dev/tpmrm0", G_FILE_TEST_EXISTS) || g_file_test("/dev/tpm0", G_FILE_TEST_EXISTS);
+}
+
 static bool sinty_guest(void) {
     return g_file_test("/run/sinty-key/guest", G_FILE_TEST_EXISTS);
 }
@@ -1028,7 +1038,7 @@ static void find_os_logo(void) {
         g_free(content);
     }
     auth_is_pin = (id[0] != '\0' && g_str_has_prefix(id, "sinty"));
-    auth_has_tpm = g_file_test("/dev/tpmrm0", G_FILE_TEST_EXISTS) || g_file_test("/dev/tpm0", G_FILE_TEST_EXISTS);
+    auth_has_tpm = sinty_tier_tpm();
     if (try_logo_file(logo)) return;
     if (try_logo_file(id)) return;
     try_logo_file("emblem-singularity");
