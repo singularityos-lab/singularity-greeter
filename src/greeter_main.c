@@ -660,12 +660,14 @@ static void greetd_handle(void) {
                         pending_password[0] = '\0';
                         auth_prompt_waiting = false;
                         snprintf(status_text, sizeof status_text, "%s", "Authenticating...");
+                        status_error = false;
                     } else {
                         auth_prompt_waiting = true;
-                        if (is_plain_credential_prompt(m)) status_text[0] = '\0';
-                        else snprintf(status_text, sizeof status_text, "%s", m);
+                        if (!status_error) {
+                            if (is_plain_credential_prompt(m)) status_text[0] = '\0';
+                            else snprintf(status_text, sizeof status_text, "%s", m);
+                        }
                     }
-                    status_error = false;
                     render_all();
                 }
             } else if (g_strcmp0(type, "success") == 0) {
@@ -694,10 +696,13 @@ static void greetd_handle(void) {
                     status_error = false;
                 } else {
                     if (!sinty_wait_text(status_text, sizeof status_text))
-                        snprintf(status_text, sizeof status_text, "%s", desc);
+                        snprintf(status_text, sizeof status_text, g_str_has_prefix(desc, "pam_") ? "Incorrect %s" : "%s",
+                            g_str_has_prefix(desc, "pam_") ? (auth_is_pin ? (auth_has_tpm ? "PIN" : "passphrase") : "password") : desc);
                     status_error = true;
                 }
+                bool failed = status_error;
                 if (was_authenticating && !recovery_mode) begin_authentication();
+                status_error = failed;
                 render_all();
             }
         }
