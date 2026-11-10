@@ -1380,7 +1380,7 @@ static bool key_for_selected(void) {
 static const char *key_text(void) {
     if (!key_for_selected()) return NULL;
     if (strcmp(key_state, "copy") == 0) return "This Sinty Key is an older copy. Open it with the recovery code.";
-    if (strcmp(key_state, "locked") == 0) return "Sinty Key connected. It opens with your PIN.";
+    if (strcmp(key_state, "locked") == 0) return "Sinty Key connected. It opens with your PIN, then a touch on its security key if it has one.";
     return "Sinty Key open";
 }
 
