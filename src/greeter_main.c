@@ -130,6 +130,13 @@ static void restart_authentication(void);
 static const char *key_text(void);
 static void keyd_attach(const char *username);
 static char key_pin[1024];
+#define BADGE_USER "sinty-badge"
+static char badge_ticket[128];
+static bool badge_session = false;
+static bool badge_opening = false;
+static bool key_foreign(void);
+static void badge_open(const char *pin);
+static void badge_end(void);
 
 /* ── chrome + render ────────────────────────────────────────────────────── */
 
@@ -514,14 +521,23 @@ static bool sinty_wait_text(char *out, size_t n) {
 }
 
 static void begin_authentication(void) {
-    if (preview || recovery_mode || n_users == 0 || greetd_fd < 0 || awaiting_auth) return;
+    bool badge = badge_ticket[0] != '\0';
+    if (preview || recovery_mode || (n_users == 0 && !badge) || greetd_fd < 0 || awaiting_auth) return;
     awaiting_auth = true;
     auth_prompt_waiting = false;
     auth_restart_pending = false;
     pending_password[0] = '\0';
+    status_error = false;
+    if (badge) {
+        g_strlcpy(pending_password, badge_ticket, sizeof pending_password);
+        memset(badge_ticket, 0, sizeof badge_ticket);
+        badge_session = true;
+        snprintf(status_text, sizeof status_text, "%s", "Opening a session from the Sinty Key...");
+        greetd_create_session(BADGE_USER);
+        return;
+    }
     if (status_text[0] == '\0')
         snprintf(status_text, sizeof status_text, "%s", "Touch the fingerprint sensor or enter your password");
-    status_error = false;
     greetd_create_session(users[sel_user].username);
 }
 
@@ -622,6 +638,13 @@ static void submit_recovery(void) {
 static void submit_password(void) {
     if (password_len == 0) return;
     if (recovery_mode) { submit_recovery(); return; }
+    if (key_foreign() && !badge_session) {
+        if (!badge_opening) badge_open(password);
+        memset(password, 0, sizeof password);
+        password_len = 0;
+        render_all();
+        return;
+    }
     if (n_users == 0) return;
     if (!awaiting_auth) begin_authentication();
     g_strlcpy(pending_password, password, sizeof pending_password);
@@ -688,8 +711,10 @@ static void greetd_handle(void) {
                 if (awaiting_auth) {
                     awaiting_auth = false;
                     auth_prompt_waiting = false;
-                    remember_login();
-                    keyd_attach(users[sel_user].username);
+                    if (!badge_session) {
+                        remember_login();
+                        keyd_attach(users[sel_user].username);
+                    }
                     if (n_sessions > 0) greetd_start_session(sessions[sel_session].exec);
                     wl_display_flush(display);
                     if (preview || outputs == NULL) running = false;
@@ -717,6 +742,12 @@ static void greetd_handle(void) {
                     if (!sinty_wait_text(status_text, sizeof status_text))
                         snprintf(status_text, sizeof status_text, wrong ? "Incorrect %s" : "%s",
                             wrong ? (auth_is_pin ? (auth_has_tpm ? "PIN" : "passphrase") : "password") : desc);
+                    status_error = true;
+                }
+                if (badge_session && !requested_restart) {
+                    badge_session = false;
+                    badge_end();
+                    snprintf(status_text, sizeof status_text, "%s", "The session from the Sinty Key could not start.");
                     status_error = true;
                 }
                 bool failed = status_error;
@@ -1371,6 +1402,52 @@ static void phase(const char *what) {
 
 static GDBusProxy *keyd;
 static char key_device[64], key_owner[64], key_state[16];
+static bool badge_allowed = false;
+
+static bool key_foreign(void) {
+    return keyd && badge_allowed && key_device[0] && key_owner[0] && find_user(key_owner) < 0 &&
+           strcmp(key_state, "locked") == 0;
+}
+
+static void badge_reply(GObject *source, GAsyncResult *res, gpointer data) {
+    GError *err = NULL;
+    GVariant *v = g_dbus_proxy_call_finish(G_DBUS_PROXY(source), res, &err);
+    badge_opening = false;
+    if (!v) {
+        char *name = err ? g_dbus_error_get_remote_error(err) : NULL;
+        const char *why = "The Sinty Key could not be opened.";
+        if (name && g_str_has_suffix(name, ".WrongPin")) why = "Incorrect PIN";
+        else if (name && g_str_has_suffix(name, ".Disabled")) why = "This computer does not open sessions from a Sinty Key.";
+        else if (name && g_str_has_suffix(name, ".Unverified")) why = "This computer is not running a verified system, so the Sinty Key stays closed.";
+        else if (name && g_str_has_suffix(name, ".Busy")) why = "A session from a Sinty Key is already open on this computer.";
+        else if (name && g_str_has_suffix(name, ".SecurityKeyRequired")) why = "Plug in the security key of this Sinty Key and touch it.";
+        snprintf(status_text, sizeof status_text, "%s", why);
+        status_error = true;
+        g_free(name);
+        g_clear_error(&err);
+        render_all();
+        return;
+    }
+    const char *user = NULL, *ticket = NULL;
+    g_variant_get(v, "(&s&s)", &user, &ticket);
+    g_strlcpy(badge_ticket, ticket, sizeof badge_ticket);
+    g_variant_unref(v);
+    restart_authentication();
+    render_all();
+}
+
+static void badge_open(const char *pin) {
+    badge_opening = true;
+    snprintf(status_text, sizeof status_text, "%s", "Opening the Sinty Key...");
+    status_error = false;
+    g_dbus_proxy_call(keyd, "Badge", g_variant_new("(ss)", key_device, pin),
+                      G_DBUS_CALL_FLAGS_NONE, 60000, NULL, badge_reply, NULL);
+}
+
+static void badge_end(void) {
+    if (!keyd) return;
+    g_dbus_proxy_call(keyd, "EndBadge", NULL, G_DBUS_CALL_FLAGS_NONE, 20000, NULL, NULL, NULL);
+}
 
 static bool key_for_selected(void) {
     if (!key_device[0] || n_users == 0) return false;
@@ -1378,6 +1455,7 @@ static bool key_for_selected(void) {
 }
 
 static const char *key_text(void) {
+    if (key_foreign()) return "Sinty Key from another computer. Enter its PIN to open your session from it.";
     if (!key_for_selected()) return NULL;
     if (strcmp(key_state, "copy") == 0) return "This Sinty Key is an older copy. Open it with the recovery code.";
     if (strcmp(key_state, "locked") == 0) return "Sinty Key connected. It opens with your PIN, then a touch on its security key if it has one.";
@@ -1399,6 +1477,9 @@ static void keyd_refresh(void) {
         }
     }
     if (v) g_variant_unref(v);
+    GVariant *a = keyd ? g_dbus_proxy_get_cached_property(keyd, "BadgeAllowed") : NULL;
+    badge_allowed = a && g_variant_is_of_type(a, G_VARIANT_TYPE_BOOLEAN) && g_variant_get_boolean(a);
+    if (a) g_variant_unref(a);
     int i = key_owner[0] ? find_user(key_owner) : -1;
     if (i >= 0 && i != sel_user && password_len == 0 && !recovery_mode && !awaiting_auth) {
         sel_user = i;
