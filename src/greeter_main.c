@@ -31,6 +31,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "loginui.h"
+#include "gpu_notice.h"
 
 /* ── model ──────────────────────────────────────────────────────────────── */
 
@@ -57,6 +58,7 @@ static char password[1024];
 static size_t password_len = 0;
 static char pending_password[1024];
 static char status_text[128] = "";
+static const char *gpu_text = NULL;
 static bool auth_is_pin = false; /* SintyOS: the credential is a PIN, not a Unix password */
 static bool auth_has_tpm = true;
 static bool recovery_mode = false; /* --recovery: forgotten-PIN escape hatch, launched as root by sinty-greetd-launch */
@@ -289,7 +291,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     st.avatar = u ? u->avatar : NULL;
     st.background = u ? u->bg : NULL;
     st.password_dots = (int)password_len;
-    st.status_text = status_text[0] ? status_text : key_text() ? key_text() : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : NULL);
+    st.status_text = status_text[0] ? status_text : key_text() ? key_text() : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : gpu_text);
     st.status_error = status_error;
     if (recovery_mode)
         st.auth_label = recovery_step == 0 ? "Recovery code" : (auth_has_tpm ? "New PIN" : "New passphrase");
@@ -1524,6 +1526,8 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--recovery") == 0) recovery_mode = true;
     }
     if (getenv("SINGULARITY_GREETER_PREVIEW")) preview = true;
+    gpu_text = gpu_notice("/sys");
+    if (gpu_text) fprintf(stderr, "greeter: %s\n", gpu_text);
 
     /* Initialize fontconfig explicitly before any cairo text/font use. cairo
      * otherwise auto-inits it on first use and fontconfig prints the "using

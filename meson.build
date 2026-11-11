@@ -35,7 +35,7 @@ ls_h = custom_target('wlr-layer-shell-unstable-v1-client-protocol.h',
   command: [wayland_scanner, 'client-header', '@INPUT@', '@OUTPUT@'])
 
 executable('singularity-greeter',
-  ['src/greeter_main.c', xdg_c, xdg_h, ls_c, ls_h],
+  ['src/greeter_main.c', 'src/gpu_notice.c', xdg_c, xdg_h, ls_c, ls_h],
   dependencies: [wl_client_dep, xkb_dep, glib_dep, gio_dep, json_dep, loginui_dep, fc_dep],
   install: true,
 )
@@ -43,3 +43,5 @@ executable('singularity-greeter',
 install_data('data/dev.sinty.greeter.gschema.xml',
   install_dir: get_option('datadir') / 'glib-2.0' / 'schemas'
 )
+
+test('gpu notice', executable('gpu-notice-test', ['tests/gpu_notice_test.c', 'src/gpu_notice.c'], include_directories: include_directories('src')))
