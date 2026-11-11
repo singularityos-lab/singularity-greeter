@@ -31,7 +31,6 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "loginui.h"
-#include "gpu_notice.h"
 
 /* ── model ──────────────────────────────────────────────────────────────── */
 
@@ -1526,7 +1525,7 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--recovery") == 0) recovery_mode = true;
     }
     if (getenv("SINGULARITY_GREETER_PREVIEW")) preview = true;
-    gpu_text = gpu_notice("/sys");
+    gpu_text = loginui_gpu_notice("/sys");
     if (gpu_text) fprintf(stderr, "greeter: %s\n", gpu_text);
 
     /* Initialize fontconfig explicitly before any cairo text/font use. cairo
