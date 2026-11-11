@@ -269,9 +269,12 @@ static void handoff_frame_done(void *data, struct wl_callback *cb, uint32_t time
 static const struct wl_callback_listener handoff_frame_listener = { .done = handoff_frame_done };
 
 static void render_surface(struct wl_surface *surface, int w, int h) {
+    int32_t bs = render_scale > 0 ? render_scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, (uint32_t)w * (uint32_t)bs,
+                                                     (uint32_t)h * (uint32_t)bs, &cr);
     if (!b) return;
+    cairo_scale(cr, bs, bs);
 
     struct g_user *u = (n_users > 0) ? &users[sel_user] : NULL;
 
@@ -384,8 +387,9 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     }
 
     cairo_destroy(cr);
+    wl_surface_set_buffer_scale(surface, bs);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(surface, 0, 0, w, h);
+    wl_surface_damage_buffer(surface, 0, 0, w * bs, h * bs);
     wl_surface_commit(surface);
 }
 
@@ -1234,15 +1238,18 @@ static void handoff_configure(void *data, struct zwlr_layer_surface_v1 *ls,
                               uint32_t serial, uint32_t w, uint32_t h) {
     struct g_output *o = data;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
+    int32_t bs = o->scale > 0 ? o->scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, w * (uint32_t)bs, h * (uint32_t)bs, &cr);
     if (!b) { o->handoff_presented = true; return; }
-    loginui_render_brand_progress(cr, (int)w, (int)h, o->scale > 0 ? o->scale : 1, brand_logo, 0.0, 1.0);
+    cairo_scale(cr, bs, bs);
+    loginui_render_brand_progress(cr, (int)w, (int)h, bs, brand_logo, 0.0, 1.0);
     cairo_destroy(cr);
     struct wl_callback *cb = wl_surface_frame(o->handoff_surface);
     wl_callback_add_listener(cb, &handoff_presented_listener, o);
+    wl_surface_set_buffer_scale(o->handoff_surface, bs);
     wl_surface_attach(o->handoff_surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(o->handoff_surface, 0, 0, w, h);
+    wl_surface_damage_buffer(o->handoff_surface, 0, 0, (int)(w * (uint32_t)bs), (int)(h * (uint32_t)bs));
     wl_surface_commit(o->handoff_surface);
 }
 static void handoff_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
