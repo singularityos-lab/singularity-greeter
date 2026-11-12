@@ -58,6 +58,7 @@ static size_t password_len = 0;
 static char pending_password[1024];
 static char status_text[128] = "";
 static const char *gpu_text = NULL;
+static const char *channel_label = NULL;
 static bool auth_is_pin = false; /* SintyOS: the credential is a PIN, not a Unix password */
 static bool auth_has_tpm = true;
 static bool recovery_mode = false; /* --recovery: forgotten-PIN escape hatch, launched as root by sinty-greetd-launch */
@@ -378,6 +379,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     if (handoff) {
         cairo_push_group(cr);
         loginui_render_brand_progress(cr, w, h, render_scale, brand_logo, 0.0, 1.0);
+        loginui_render_brand_channel(cr, w, h, render_scale, channel_label, 1.0);
         cairo_pop_group_to_source(cr);
         if (handoff_progress >= 1.0) cairo_paint(cr);
         else cairo_paint_with_alpha(cr, handoff_progress);
@@ -1238,6 +1240,7 @@ static void handoff_configure(void *data, struct zwlr_layer_surface_v1 *ls,
     struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
     if (!b) { o->handoff_presented = true; return; }
     loginui_render_brand_progress(cr, (int)w, (int)h, o->scale > 0 ? o->scale : 1, brand_logo, 0.0, 1.0);
+    loginui_render_brand_channel(cr, (int)w, (int)h, o->scale > 0 ? o->scale : 1, channel_label, 1.0);
     cairo_destroy(cr);
     struct wl_callback *cb = wl_surface_frame(o->handoff_surface);
     wl_callback_add_listener(cb, &handoff_presented_listener, o);
@@ -1526,6 +1529,7 @@ int main(int argc, char **argv) {
     }
     if (getenv("SINGULARITY_GREETER_PREVIEW")) preview = true;
     gpu_text = loginui_gpu_notice("/sys");
+    channel_label = loginui_update_channel(NULL);
     if (gpu_text) fprintf(stderr, "greeter: %s\n", gpu_text);
 
     /* Initialize fontconfig explicitly before any cairo text/font use. cairo
