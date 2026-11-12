@@ -76,6 +76,9 @@ static bool handoff = false;
 static double handoff_t0 = 0.0;
 static double handoff_s = 0.0;
 static double handoff_progress = 0.0;
+static bool applying_update = false;
+static double applying_t0 = 0.0;
+static double applied_at = 0.0;
 static cairo_surface_t *brand_logo = NULL;
 static int32_t render_scale = 1;
 
@@ -385,6 +388,12 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
         else cairo_paint_with_alpha(cr, handoff_progress);
     }
 
+    if (applying_update) {
+        double p = loginui_progress_curve(0.0, 0.9, handoff_now() - applying_t0, 20.0);
+        loginui_render_brand_progress(cr, w, h, render_scale, brand_logo, p, 1.0);
+        loginui_render_brand_notice(cr, w, h, render_scale, "Installing update", 1.0);
+    }
+
     cairo_destroy(cr);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
     wl_surface_damage_buffer(surface, 0, 0, w, h);
@@ -429,6 +438,108 @@ static bool handoff_tick(void) {
     handoff_progress = p >= 1.0 ? 1.0 : (p < 0.0 ? 0.0 : p);
     render_all();
     return false;
+}
+
+/* ── live update between logout and login ───────────────────────────────── */
+
+#define UPDATED_SOCK "/run/updated.sock"
+#define LIVE_FAILED_PATH "/run/sinty/live/failed"
+#define LIVE_RESTART_GRACE_S 30.0
+
+static char *updated_request(const char *method, const char *path, int timeout_s, int *code) {
+    *code = 0;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return NULL;
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", UPDATED_SOCK);
+    struct timeval tv = { .tv_sec = timeout_s };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) { close(fd); return NULL; }
+    char req[256];
+    int n = snprintf(req, sizeof req, "%s %s HTTP/1.0\r\nHost: localhost\r\n\r\n", method, path);
+    if (write(fd, req, (size_t)n) != n) { close(fd); return NULL; }
+    GString *resp = g_string_new(NULL);
+    char buf[4096];
+    ssize_t r;
+    while ((r = read(fd, buf, sizeof buf)) > 0 && resp->len < 65536) g_string_append_len(resp, buf, r);
+    close(fd);
+    if (r < 0) { g_string_free(resp, TRUE); return NULL; }
+    if (sscanf(resp->str, "HTTP/%*s %d", code) != 1) *code = 0;
+    const char *body = strstr(resp->str, "\r\n\r\n");
+    char *out = body ? g_strdup(body + 4) : NULL;
+    g_string_free(resp, TRUE);
+    return out;
+}
+
+static char *live_staged_class(void) {
+    int code;
+    char *body = updated_request("GET", "/status", 2, &code);
+    if (!body) return NULL;
+    char *staged = NULL;
+    JsonParser *parser = json_parser_new();
+    JsonNode *root = code == 200 && json_parser_load_from_data(parser, body, -1, NULL)
+        ? json_parser_get_root(parser) : NULL;
+    if (root && JSON_NODE_HOLDS_OBJECT(root)) {
+        JsonObject *o = json_node_get_object(root);
+        JsonNode *live = json_object_get_member(o, "live");
+        if (g_strcmp0(json_object_get_string_member_with_default(o, "state", ""), "ready") == 0
+            && live && JSON_NODE_HOLDS_OBJECT(live)) {
+            JsonObject *l = json_node_get_object(live);
+            const char *to = json_object_get_string_member_with_default(l, "to", "");
+            char *failed = NULL;
+            g_file_get_contents(LIVE_FAILED_PATH, &failed, NULL, NULL);
+            const char *klass = json_object_get_string_member_with_default(l, "class", "");
+            if (json_object_get_boolean_member_with_default(l, "eligible", FALSE)
+                && (g_strcmp0(klass, "relogin") == 0 || g_strcmp0(klass, "silent") == 0)
+                && !(failed && g_strcmp0(g_strstrip(failed), to) == 0))
+                staged = g_strdup(klass);
+            g_free(failed);
+        }
+    }
+    g_object_unref(parser);
+    g_free(body);
+    return staged;
+}
+
+static void apply_live_thread(GTask *task, gpointer source, gpointer data, GCancellable *cancellable) {
+    (void)source; (void)data; (void)cancellable;
+    int code;
+    g_free(updated_request("POST", "/apply-live", 300, &code));
+    g_task_return_boolean(task, code >= 200 && code < 300);
+}
+
+static void apply_live_done(GObject *source, GAsyncResult *res, gpointer data) {
+    (void)source; (void)data;
+    bool ok = g_task_propagate_boolean(G_TASK(res), NULL);
+    if (!applying_update) {
+        fprintf(stderr, "greeter: silent live update %s\n", ok ? "applied" : "failed");
+        return;
+    }
+    fprintf(stderr, "greeter: live update %s\n", ok ? "applied, waiting for the compositor restart" : "failed, back to login");
+    if (ok) {
+        applied_at = handoff_now();
+        return;
+    }
+    applying_update = false;
+    render_all();
+}
+
+static void begin_applying_update(bool visible) {
+    applying_update = visible;
+    applying_t0 = handoff_now();
+    GTask *task = g_task_new(NULL, NULL, apply_live_done, NULL);
+    g_task_run_in_thread(task, apply_live_thread);
+    g_object_unref(task);
+}
+
+static void applying_update_tick(void) {
+    if (!applying_update) return;
+    if (applied_at > 0.0 && handoff_now() - applied_at > LIVE_RESTART_GRACE_S) {
+        applying_update = false;
+        applied_at = 0.0;
+    }
+    render_all();
 }
 
 /* ── greetd IPC ─────────────────────────────────────────────────────────── */
@@ -1094,7 +1205,7 @@ static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, w
 }
 static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time,
                       uint32_t button, uint32_t state) {
-    if (handoff || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return;
+    if (handoff || applying_update || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return;
     if (power_open) {
         for (int i = 0; i < 3; i++) if (in_rect(&power_item[i])) { power_open = false; power_action(i); render_all(); return; }
         if (!in_rect(&power_hit)) { power_open = false; render_all(); return; }
@@ -1140,7 +1251,7 @@ static void kb_repeat(void *d, struct wl_keyboard *kb, int32_t rate, int32_t del
 
 static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
                    uint32_t time, uint32_t key, uint32_t state) {
-    if (handoff || !xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+    if (handoff || applying_update || !xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
     xkb_keycode_t kc = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, kc);
 
@@ -1575,6 +1686,10 @@ int main(int argc, char **argv) {
     xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     phase("xkb ready");
 
+    char *live_class = preview || recovery_mode ? NULL : live_staged_class();
+    if (live_class) begin_applying_update(strcmp(live_class, "relogin") == 0);
+    g_free(live_class);
+
     if (preview) {
         create_preview_window();
     } else {
@@ -1595,7 +1710,7 @@ int main(int argc, char **argv) {
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, handoff ? 100 : 1000);
+        int pr = poll(pfds, 2, handoff || applying_update ? 100 : 1000);
 
         if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             wl_display_cancel_read(display);
@@ -1619,6 +1734,7 @@ int main(int argc, char **argv) {
         while (g_main_context_iteration(NULL, FALSE));
         if (handoff_tick()) { running = false; break; }
         if (handoff) continue;
+        applying_update_tick();
 
         time_t now = time(NULL);
         struct tm tm; localtime_r(&now, &tm);
