@@ -89,6 +89,15 @@ static struct rect power_hit;
 static struct rect power_item[3];
 static bool power_open = false;
 static double ptr_x, ptr_y;
+static LoginUiKeypad keypad;
+static int keypad_default = -1;
+static bool keypad_shown = false;
+static double cover = 1.0, cover_from = 1.0, cover_target = 1.0, cover_t0 = 0.0;
+static bool pressing = false, swiped = false;
+static double press_y = 0.0;
+static double last_input = 0.0;
+static int32_t touch_id = -1;
+static double touch_x, touch_y;
 
 /* ── wayland globals ────────────────────────────────────────────────────── */
 
@@ -113,6 +122,7 @@ static struct wl_shm *shm;
 static struct wl_seat *seat;
 static struct wl_keyboard *keyboard;
 static struct wl_pointer *pointer;
+static struct wl_touch *touch;
 static struct zwlr_layer_shell_v1 *layer_shell;
 static struct xdg_wm_base *wm_base;
 static struct g_output *outputs;
@@ -273,9 +283,11 @@ static void handoff_frame_done(void *data, struct wl_callback *cb, uint32_t time
 static const struct wl_callback_listener handoff_frame_listener = { .done = handoff_frame_done };
 
 static void render_surface(struct wl_surface *surface, int w, int h) {
+    int s = render_scale > 0 ? render_scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, w * s, h * s, &cr);
     if (!b) return;
+    cairo_scale(cr, s, s);
 
     struct g_user *u = (n_users > 0) ? &users[sel_user] : NULL;
 
@@ -301,11 +313,23 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     else
         st.auth_label = auth_is_pin ? (auth_has_tpm ? "PIN" : "Passphrase") : "Password";
 
+    bool compact = loginui_compact(w, h);
+    keypad_shown = compact && (touch || !keyboard);
+    bool digits = recovery_mode ? (recovery_step == 1 && auth_is_pin && auth_has_tpm) : (auth_is_pin && auth_has_tpm);
+    LoginUiKeypadPage page = digits ? LOGINUI_KEYPAD_DIGITS : LOGINUI_KEYPAD_LETTERS;
+    if ((int)page != keypad_default) {
+        keypad_default = (int)page;
+        loginui_keypad_set_page(&keypad, page);
+    }
+    st.cover = keypad_shown ? cover : 0.0;
+    st.keypad = keypad_shown ? &keypad : NULL;
+    bool covered_now = keypad_shown && cover > 0.5;
+
     double cx, cy, cw, ch;
     loginui_render(cr, &st, &cx, &cy, &cw, &ch);
 
     for (int i = 0; i < 32; i++) user_hit[i].valid = false;
-    if (n_users > 1) {
+    if (n_users > 1 && !covered_now) {
         double a = 44, gap = 16;
         double total = n_users * a + (n_users - 1) * gap;
         double x = (w - total) / 2.0, y = 36;
@@ -337,12 +361,12 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     }
 
     session_hit.valid = false;
-    if (n_sessions > 0) {
+    if (n_sessions > 0 && !covered_now) {
         const char *sname = sessions[sel_session].name;
         int tw, th;
         loginui_text_size(cr, "Sans 12", sname, &tw, &th);
         double cw2 = tw + 28, chh = 28;
-        double sx = w - 16 - cw2, sy = h - 16 - chh;
+        double sx = compact ? 16 : w - 16 - cw2, sy = compact ? 18 : h - 16 - chh;
         loginui_rounded_rect(cr, sx, sy, cw2, chh, 14);
         cairo_set_source_rgba(cr, 0.13, 0.13, 0.14, 0.92);
         cairo_fill(cr);
@@ -351,7 +375,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     }
     (void)cx; (void)cy; (void)cw; (void)ch;
 
-    if (os_logo) {
+    if (os_logo && !compact) {
         int lw = cairo_image_surface_get_width(os_logo);
         int lh = cairo_image_surface_get_height(os_logo);
         cairo_set_source_surface(cr, os_logo, (w - lw) / 2.0, h - 18 - lh);
@@ -395,9 +419,36 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
     }
 
     cairo_destroy(cr);
+    wl_surface_set_buffer_scale(surface, s);
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(surface, 0, 0, w, h);
+    wl_surface_damage_buffer(surface, 0, 0, w * s, h * s);
     wl_surface_commit(surface);
+}
+
+static void set_cover(double target) {
+    if (target == cover_target) return;
+    cover_from = cover;
+    cover_target = target;
+    cover_t0 = handoff_now();
+    if (loginui_reduced_motion()) cover = target;
+    render_all();
+}
+
+static bool cover_tick(void) {
+    if (cover == cover_target) return false;
+    double t = (handoff_now() - cover_t0) / 0.26;
+    if (t >= 1.0) {
+        cover = cover_target;
+    } else {
+        double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
+        cover = cover_from + (cover_target - cover_from) * e;
+    }
+    render_all();
+    return cover != cover_target;
+}
+
+static bool covered(void) {
+    return keypad_shown && cover_target > 0.5;
 }
 
 static void render_all(void) {
@@ -1196,16 +1247,7 @@ static bool in_rect(struct rect *r) {
            ptr_y >= r->y && ptr_y <= r->y + r->h;
 }
 
-static void pt_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
-    ptr_x = wl_fixed_to_double(x); ptr_y = wl_fixed_to_double(y);
-}
-static void pt_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf) {}
-static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
-    ptr_x = wl_fixed_to_double(x); ptr_y = wl_fixed_to_double(y);
-}
-static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time,
-                      uint32_t button, uint32_t state) {
-    if (handoff || applying_update || button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED) return;
+static void pointer_click(void) {
     if (power_open) {
         for (int i = 0; i < 3; i++) if (in_rect(&power_item[i])) { power_open = false; power_action(i); render_all(); return; }
         if (!in_rect(&power_hit)) { power_open = false; render_all(); return; }
@@ -1216,6 +1258,82 @@ static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t t
         sel_user = i; restore_session_for_user(); status_text[0] = '\0'; memset(password, 0, sizeof password); password_len = 0; restart_authentication(); render_all(); return;
     }
 }
+
+static void type_text(const char *buf, size_t n) {
+    if (n > 0 && (unsigned char)buf[0] >= 0x20 && password_len + n < sizeof password - 1) {
+        memcpy(password + password_len, buf, n);
+        password_len += n;
+        password[password_len] = '\0';
+        status_text[0] = '\0';
+        render_all();
+    }
+}
+
+static void erase_last(void) {
+    while (password_len > 0 && ((unsigned char)password[password_len - 1] & 0xC0) == 0x80)
+        password[--password_len] = '\0';
+    if (password_len > 0) password[--password_len] = '\0';
+    status_text[0] = '\0';
+    render_all();
+}
+
+static void keypad_activate(int i) {
+    char text[8];
+    switch (loginui_keypad_activate(&keypad, i, text, sizeof text)) {
+    case LOGINUI_KEYPAD_TEXT: type_text(text, strlen(text)); break;
+    case LOGINUI_KEYPAD_BACKSPACE: erase_last(); break;
+    case LOGINUI_KEYPAD_ENTER: submit_password(); render_all(); break;
+    default: render_all(); break;
+    }
+}
+
+static void input_press(double x, double y) {
+    if (handoff || applying_update) return;
+    last_input = handoff_now();
+    ptr_x = x; ptr_y = y;
+    pressing = true; swiped = false; press_y = y;
+    if (power_open || in_rect(&power_hit)) { pressing = false; pointer_click(); return; }
+    if (covered()) return;
+    int i = keypad_shown ? loginui_keypad_key_at(&keypad, x, y) : -1;
+    if (i >= 0) { keypad.pressed = i; render_all(); return; }
+    pointer_click();
+}
+
+static void input_motion(double x, double y) {
+    ptr_x = x; ptr_y = y;
+    if (!pressing) return;
+    if (covered()) {
+        if (press_y - y > 40) { swiped = true; last_input = handoff_now(); set_cover(0.0); }
+        return;
+    }
+    if (keypad.pressed >= 0 && loginui_keypad_key_at(&keypad, x, y) != keypad.pressed) { keypad.pressed = -1; render_all(); }
+}
+
+static void input_release(double x, double y) {
+    if (!pressing) return;
+    pressing = false;
+    last_input = handoff_now();
+    if (covered()) { if (!swiped) set_cover(0.0); return; }
+    int i = keypad.pressed;
+    if (i < 0) return;
+    keypad.pressed = -1;
+    if (loginui_keypad_key_at(&keypad, x, y) == i) keypad_activate(i);
+    else render_all();
+}
+
+static void pt_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
+    ptr_x = wl_fixed_to_double(x); ptr_y = wl_fixed_to_double(y);
+}
+static void pt_leave(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf) {}
+static void pt_motion(void *d, struct wl_pointer *p, uint32_t t, wl_fixed_t x, wl_fixed_t y) {
+    input_motion(wl_fixed_to_double(x), wl_fixed_to_double(y));
+}
+static void pt_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time,
+                      uint32_t button, uint32_t state) {
+    if (button != BTN_LEFT) return;
+    if (state == WL_POINTER_BUTTON_STATE_PRESSED) input_press(ptr_x, ptr_y);
+    else input_release(ptr_x, ptr_y);
+}
 static void pt_axis(void *d, struct wl_pointer *p, uint32_t t, uint32_t a, wl_fixed_t v) {}
 static void pt_frame(void *d, struct wl_pointer *p) {}
 static void pt_axis_source(void *d, struct wl_pointer *p, uint32_t s) {}
@@ -1225,6 +1343,36 @@ static const struct wl_pointer_listener pointer_listener = {
     .enter = pt_enter, .leave = pt_leave, .motion = pt_motion, .button = pt_button,
     .axis = pt_axis, .frame = pt_frame, .axis_source = pt_axis_source,
     .axis_stop = pt_axis_stop, .axis_discrete = pt_axis_discrete,
+};
+
+static void tc_down(void *d, struct wl_touch *t, uint32_t serial, uint32_t time,
+                    struct wl_surface *sf, int32_t id, wl_fixed_t x, wl_fixed_t y) {
+    if (touch_id >= 0) return;
+    touch_id = id;
+    touch_x = wl_fixed_to_double(x); touch_y = wl_fixed_to_double(y);
+    input_press(touch_x, touch_y);
+}
+static void tc_up(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, int32_t id) {
+    if (id != touch_id) return;
+    touch_id = -1;
+    input_release(touch_x, touch_y);
+}
+static void tc_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y) {
+    if (id != touch_id) return;
+    touch_x = wl_fixed_to_double(x); touch_y = wl_fixed_to_double(y);
+    input_motion(touch_x, touch_y);
+}
+static void tc_frame(void *d, struct wl_touch *t) {}
+static void tc_cancel(void *d, struct wl_touch *t) {
+    touch_id = -1;
+    pressing = false;
+    if (keypad.pressed >= 0) { keypad.pressed = -1; render_all(); }
+}
+static void tc_shape(void *d, struct wl_touch *t, int32_t id, wl_fixed_t major, wl_fixed_t minor) {}
+static void tc_orientation(void *d, struct wl_touch *t, int32_t id, wl_fixed_t orientation) {}
+static const struct wl_touch_listener touch_listener = {
+    .down = tc_down, .up = tc_up, .motion = tc_motion, .frame = tc_frame,
+    .cancel = tc_cancel, .shape = tc_shape, .orientation = tc_orientation,
 };
 
 /* ── keyboard ───────────────────────────────────────────────────────────── */
@@ -1239,7 +1387,11 @@ static void kb_keymap(void *d, struct wl_keyboard *kb, uint32_t format, int fd, 
     xkb_keymap = xkb_keymap_new_from_string(xkb_context, map,
         XKB_KEYMAP_FORMAT_TEXT_V1, XKB_KEYMAP_COMPILE_NO_FLAGS);
     munmap(map, size);
-    if (xkb_keymap) xkb_state = xkb_state_new(xkb_keymap);
+    if (xkb_keymap) {
+        xkb_state = xkb_state_new(xkb_keymap);
+        loginui_keypad_set_keymap(&keypad, xkb_keymap);
+        render_all();
+    }
 }
 static void kb_enter(void *d, struct wl_keyboard *kb, uint32_t s, struct wl_surface *sf, struct wl_array *keys) {}
 static void kb_leave(void *d, struct wl_keyboard *kb, uint32_t s, struct wl_surface *sf) {}
@@ -1252,6 +1404,8 @@ static void kb_repeat(void *d, struct wl_keyboard *kb, int32_t rate, int32_t del
 static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
                    uint32_t time, uint32_t key, uint32_t state) {
     if (handoff || applying_update || !xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+    last_input = handoff_now();
+    if (covered()) set_cover(0.0);
     xkb_keycode_t kc = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, kc);
 
@@ -1261,9 +1415,7 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
         submit_password();
         return;
     case XKB_KEY_BackSpace:
-        if (password_len > 0) password[--password_len] = '\0';
-        status_text[0] = '\0';
-        render_all();
+        erase_last();
         return;
     case XKB_KEY_Escape:
         if (recovery_mode) { recovery_mode = false; recovery_step = 0; restart_authentication(); }
@@ -1292,13 +1444,7 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
 
     char buf[8];
     int n = xkb_state_key_get_utf8(xkb_state, kc, buf, sizeof buf);
-    if (n > 0 && (unsigned char)buf[0] >= 0x20 && password_len + n < sizeof password - 1) {
-        memcpy(password + password_len, buf, n);
-        password_len += n;
-        password[password_len] = '\0';
-        status_text[0] = '\0';
-        render_all();
-    }
+    if (n > 0) type_text(buf, (size_t)n);
 }
 static const struct wl_keyboard_listener keyboard_listener = {
     .keymap = kb_keymap, .enter = kb_enter, .leave = kb_leave,
@@ -1347,16 +1493,19 @@ static void handoff_configure(void *data, struct zwlr_layer_surface_v1 *ls,
                               uint32_t serial, uint32_t w, uint32_t h) {
     struct g_output *o = data;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
+    int s = o->scale > 0 ? o->scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w, h, &cr);
+    struct loginui_buffer *b = loginui_create_buffer(shm, w * s, h * s, &cr);
     if (!b) { o->handoff_presented = true; return; }
+    cairo_scale(cr, s, s);
     loginui_render_brand_progress(cr, (int)w, (int)h, o->scale > 0 ? o->scale : 1, brand_logo, 0.0, 1.0);
     loginui_render_brand_channel(cr, (int)w, (int)h, o->scale > 0 ? o->scale : 1, channel_label, 1.0);
     cairo_destroy(cr);
     struct wl_callback *cb = wl_surface_frame(o->handoff_surface);
     wl_callback_add_listener(cb, &handoff_presented_listener, o);
+    wl_surface_set_buffer_scale(o->handoff_surface, s);
     wl_surface_attach(o->handoff_surface, b->wl_buffer, 0, 0);
-    wl_surface_damage_buffer(o->handoff_surface, 0, 0, w, h);
+    wl_surface_damage_buffer(o->handoff_surface, 0, 0, w * s, h * s);
     wl_surface_commit(o->handoff_surface);
 }
 static void handoff_closed(void *data, struct zwlr_layer_surface_v1 *ls) {
@@ -1419,6 +1568,15 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
     (void)data;
     bool has_keyboard = (caps & WL_SEAT_CAPABILITY_KEYBOARD) != 0;
     bool has_pointer = (caps & WL_SEAT_CAPABILITY_POINTER) != 0;
+    bool has_touch = (caps & WL_SEAT_CAPABILITY_TOUCH) != 0;
+    if (has_touch && !touch) {
+        touch = wl_seat_get_touch(s);
+        wl_touch_add_listener(touch, &touch_listener, NULL);
+    } else if (!has_touch && touch) {
+        wl_touch_release(touch);
+        touch = NULL;
+        touch_id = -1;
+    }
     if (has_keyboard && !keyboard) {
         keyboard = wl_seat_get_keyboard(s);
         wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
@@ -1684,6 +1842,7 @@ int main(int argc, char **argv) {
 
     phase("wayland globals bound");
     xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    loginui_keypad_init(&keypad, xkb_keymap, LOGINUI_KEYPAD_LETTERS);
     phase("xkb ready");
 
     char *live_class = preview || recovery_mode ? NULL : live_staged_class();
@@ -1710,7 +1869,7 @@ int main(int argc, char **argv) {
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, handoff || applying_update ? 100 : 1000);
+        int pr = poll(pfds, 2, handoff || applying_update ? 100 : cover != cover_target ? 16 : 1000);
 
         if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             wl_display_cancel_read(display);
@@ -1735,6 +1894,10 @@ int main(int argc, char **argv) {
         if (handoff_tick()) { running = false; break; }
         if (handoff) continue;
         applying_update_tick();
+        cover_tick();
+        if (keypad_shown && cover_target == 0.0 && password_len == 0 && !awaiting_auth && !recovery_mode &&
+            !pressing && handoff_now() - last_input > 30.0)
+            set_cover(1.0);
 
         time_t now = time(NULL);
         struct tm tm; localtime_r(&now, &tm);
