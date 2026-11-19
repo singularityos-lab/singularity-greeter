@@ -93,8 +93,9 @@ static LoginUiKeypad keypad;
 static int keypad_default = -1;
 static bool keypad_shown = false;
 static double cover = 1.0, cover_from = 1.0, cover_target = 1.0, cover_t0 = 0.0;
-static bool pressing = false, swiped = false;
-static double press_y = 0.0;
+static bool pressing = false, swiped = false, dragging = false;
+static double press_y = 0.0, last_y = 0.0, last_dy = 0.0, drag_base = 1.0;
+static int surface_h = 0;
 static double last_input = 0.0;
 static int32_t touch_id = -1;
 static double touch_x, touch_y;
@@ -314,6 +315,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
         st.auth_label = auth_is_pin ? (auth_has_tpm ? "PIN" : "Passphrase") : "Password";
 
     bool compact = loginui_compact(w, h);
+    surface_h = h;
     keypad_shown = compact && (touch || !keyboard);
     bool digits = recovery_mode ? (recovery_step == 1 && auth_is_pin && auth_has_tpm) : (auth_is_pin && auth_has_tpm);
     LoginUiKeypadPage page = digits ? LOGINUI_KEYPAD_DIGITS : LOGINUI_KEYPAD_LETTERS;
@@ -426,7 +428,7 @@ static void render_surface(struct wl_surface *surface, int w, int h) {
 }
 
 static void set_cover(double target) {
-    if (target == cover_target) return;
+    if (target == cover_target && cover == target) return;
     cover_from = cover;
     cover_target = target;
     cover_t0 = handoff_now();
@@ -1291,7 +1293,8 @@ static void input_press(double x, double y) {
     if (handoff || applying_update) return;
     last_input = handoff_now();
     ptr_x = x; ptr_y = y;
-    pressing = true; swiped = false; press_y = y;
+    pressing = true; swiped = false; dragging = false;
+    press_y = last_y = y; last_dy = 0.0;
     if (power_open || in_rect(&power_hit)) { pressing = false; pointer_click(); return; }
     if (covered()) return;
     int i = keypad_shown ? loginui_keypad_key_at(&keypad, x, y) : -1;
@@ -1302,8 +1305,24 @@ static void input_press(double x, double y) {
 static void input_motion(double x, double y) {
     ptr_x = x; ptr_y = y;
     if (!pressing) return;
-    if (covered()) {
-        if (press_y - y > 40) { swiped = true; last_input = handoff_now(); set_cover(0.0); }
+    last_dy = y - last_y;
+    last_y = y;
+    if (keypad_shown && keypad.pressed < 0) {
+        double dy = y - press_y;
+        if (!dragging && (dy > 10 || dy < -10)) {
+            if (covered() && dy < 0) { dragging = true; drag_base = 1.0; }
+            else if (!covered() && dy > 0) { dragging = true; drag_base = 0.0; }
+        }
+        if (dragging) {
+            double span = surface_h > 0 ? surface_h * 0.4 : 400.0;
+            double v = drag_base + dy / span;
+            if (v < 0.0) v = 0.0;
+            if (v > 1.0) v = 1.0;
+            cover = cover_target = v;
+            swiped = true;
+            last_input = handoff_now();
+            render_all();
+        }
         return;
     }
     if (keypad.pressed >= 0 && loginui_keypad_key_at(&keypad, x, y) != keypad.pressed) { keypad.pressed = -1; render_all(); }
@@ -1313,6 +1332,11 @@ static void input_release(double x, double y) {
     if (!pressing) return;
     pressing = false;
     last_input = handoff_now();
+    if (dragging) {
+        dragging = false;
+        set_cover(last_dy < -2 ? 0.0 : last_dy > 2 ? 1.0 : cover < 0.5 ? 0.0 : 1.0);
+        return;
+    }
     if (covered()) { if (!swiped) set_cover(0.0); return; }
     int i = keypad.pressed;
     if (i < 0) return;
