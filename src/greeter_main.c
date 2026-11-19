@@ -114,6 +114,7 @@ struct g_output {
     struct wl_surface *handoff_surface;
     struct zwlr_layer_surface_v1 *handoff_layer;
     bool handoff_presented;
+    struct loginui_buffer *pool[2];
     struct g_output *next;
 };
 
@@ -133,6 +134,7 @@ static struct xdg_surface *pv_xsurf;
 static struct xdg_toplevel *pv_top;
 static int pv_w = 1000, pv_h = 640;
 static bool pv_configured = false;
+static struct loginui_buffer *pv_pool[2];
 
 static struct xkb_context *xkb_context;
 static struct xkb_keymap *xkb_keymap;
@@ -283,10 +285,10 @@ static void handoff_frame_done(void *data, struct wl_callback *cb, uint32_t time
 }
 static const struct wl_callback_listener handoff_frame_listener = { .done = handoff_frame_done };
 
-static void render_surface(struct wl_surface *surface, int w, int h) {
+static void render_surface(struct wl_surface *surface, struct loginui_buffer **pool, int w, int h) {
     int s = render_scale > 0 ? render_scale : 1;
     cairo_t *cr;
-    struct loginui_buffer *b = loginui_create_buffer(shm, w * s, h * s, &cr);
+    struct loginui_buffer *b = loginui_pool_buffer(shm, pool, 2, w * s, h * s, &cr);
     if (!b) return;
     cairo_scale(cr, s, s);
 
@@ -455,7 +457,7 @@ static bool covered(void) {
 
 static void render_all(void) {
     if (preview) {
-        if (pv_configured) render_surface(pv_surface, pv_w, pv_h);
+        if (pv_configured) render_surface(pv_surface, pv_pool, pv_w, pv_h);
         return;
     }
     for (struct g_output *o = outputs; o; o = o->next) {
@@ -466,7 +468,7 @@ static void render_all(void) {
             wl_callback_add_listener(o->frame_cb, &handoff_frame_listener, &o->frame_cb);
         }
         render_scale = o->scale > 0 ? o->scale : 1;
-        render_surface(o->surface, (int)o->width, (int)o->height);
+        render_surface(o->surface, o->pool, (int)o->width, (int)o->height);
     }
 }
 
@@ -1483,7 +1485,7 @@ static void layer_configure(void *data, struct zwlr_layer_surface_v1 *ls,
     o->width = w; o->height = h; o->configured = true;
     zwlr_layer_surface_v1_ack_configure(ls, serial);
     render_scale = o->scale > 0 ? o->scale : 1;
-    render_surface(o->surface, (int)w, (int)h);
+    render_surface(o->surface, o->pool, (int)w, (int)h);
 }
 static void layer_closed(void *data, struct zwlr_layer_surface_v1 *ls) { running = false; }
 static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
@@ -1560,7 +1562,7 @@ static void create_handoff_surfaces(void) {
 static void xdg_surface_configure(void *data, struct xdg_surface *xs, uint32_t serial) {
     xdg_surface_ack_configure(xs, serial);
     pv_configured = true;
-    render_surface(pv_surface, pv_w, pv_h);
+    render_surface(pv_surface, pv_pool, pv_w, pv_h);
 }
 static const struct xdg_surface_listener xdg_surface_listener = { .configure = xdg_surface_configure };
 
