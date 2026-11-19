@@ -92,13 +92,8 @@ static double ptr_x, ptr_y;
 static LoginUiKeypad keypad;
 static int keypad_default = -1;
 static bool keypad_shown = false;
-static double cover = 1.0, cover_from = 1.0, cover_target = 1.0, cover_t0 = 0.0;
-static bool pressing = false, swiped = false, dragging = false;
-static double press_y = 0.0, last_y = 0.0, last_dy = 0.0, drag_base = 1.0;
+static LoginUiGesture gesture;
 static int surface_h = 0;
-static double last_input = 0.0;
-static int32_t touch_id = -1;
-static double touch_x, touch_y;
 
 /* ── wayland globals ────────────────────────────────────────────────────── */
 
@@ -325,9 +320,9 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
         keypad_default = (int)page;
         loginui_keypad_set_page(&keypad, page);
     }
-    st.cover = keypad_shown ? cover : 0.0;
+    st.cover = keypad_shown ? gesture.cover : 0.0;
     st.keypad = keypad_shown ? &keypad : NULL;
-    bool covered_now = keypad_shown && cover > 0.5;
+    bool covered_now = keypad_shown && gesture.cover > 0.5;
 
     double cx, cy, cw, ch;
     loginui_render(cr, &st, &cx, &cy, &cw, &ch);
@@ -430,29 +425,17 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
 }
 
 static void set_cover(double target) {
-    if (target == cover_target && cover == target) return;
-    cover_from = cover;
-    cover_target = target;
-    cover_t0 = handoff_now();
-    if (loginui_reduced_motion()) cover = target;
-    render_all();
+    if (loginui_gesture_set_cover(&gesture, target, handoff_now())) render_all();
 }
 
 static bool cover_tick(void) {
-    if (cover == cover_target) return false;
-    double t = (handoff_now() - cover_t0) / 0.26;
-    if (t >= 1.0) {
-        cover = cover_target;
-    } else {
-        double e = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
-        cover = cover_from + (cover_target - cover_from) * e;
-    }
+    if (!loginui_gesture_tick(&gesture, handoff_now())) return false;
     render_all();
-    return cover != cover_target;
+    return loginui_gesture_animating(&gesture);
 }
 
 static bool covered(void) {
-    return keypad_shown && cover_target > 0.5;
+    return loginui_gesture_covered(&gesture, keypad_shown);
 }
 
 static void render_all(void) {
@@ -1293,58 +1276,33 @@ static void keypad_activate(int i) {
 
 static void input_press(double x, double y) {
     if (handoff || applying_update) return;
-    last_input = handoff_now();
     ptr_x = x; ptr_y = y;
-    pressing = true; swiped = false; dragging = false;
-    press_y = last_y = y; last_dy = 0.0;
-    if (power_open || in_rect(&power_hit)) { pressing = false; pointer_click(); return; }
-    if (covered()) return;
-    int i = keypad_shown ? loginui_keypad_key_at(&keypad, x, y) : -1;
-    if (i >= 0) { keypad.pressed = i; render_all(); return; }
-    pointer_click();
+    if (power_open || in_rect(&power_hit)) {
+        gesture.last_input = handoff_now();
+        gesture.pressing = false;
+        pointer_click();
+        return;
+    }
+    switch (loginui_gesture_press(&gesture, &keypad, keypad_shown, x, y, handoff_now())) {
+    case LOGINUI_GESTURE_REDRAW: render_all(); break;
+    case LOGINUI_GESTURE_TAP: pointer_click(); break;
+    default: break;
+    }
 }
 
 static void input_motion(double x, double y) {
     ptr_x = x; ptr_y = y;
-    if (!pressing) return;
-    last_dy = y - last_y;
-    last_y = y;
-    if (keypad_shown && keypad.pressed < 0) {
-        double dy = y - press_y;
-        if (!dragging && (dy > 10 || dy < -10)) {
-            if (covered() && dy < 0) { dragging = true; drag_base = 1.0; }
-            else if (!covered() && dy > 0) { dragging = true; drag_base = 0.0; }
-        }
-        if (dragging) {
-            double span = surface_h > 0 ? surface_h * 0.4 : 400.0;
-            double v = drag_base + dy / span;
-            if (v < 0.0) v = 0.0;
-            if (v > 1.0) v = 1.0;
-            cover = cover_target = v;
-            swiped = true;
-            last_input = handoff_now();
-            render_all();
-        }
-        return;
-    }
-    if (keypad.pressed >= 0 && loginui_keypad_key_at(&keypad, x, y) != keypad.pressed) { keypad.pressed = -1; render_all(); }
+    if (loginui_gesture_motion(&gesture, &keypad, keypad_shown, x, y, surface_h, handoff_now()) == LOGINUI_GESTURE_REDRAW)
+        render_all();
 }
 
 static void input_release(double x, double y) {
-    if (!pressing) return;
-    pressing = false;
-    last_input = handoff_now();
-    if (dragging) {
-        dragging = false;
-        set_cover(last_dy < -2 ? 0.0 : last_dy > 2 ? 1.0 : cover < 0.5 ? 0.0 : 1.0);
-        return;
+    int key = -1;
+    switch (loginui_gesture_release(&gesture, &keypad, keypad_shown, x, y, handoff_now(), &key)) {
+    case LOGINUI_GESTURE_REDRAW: render_all(); break;
+    case LOGINUI_GESTURE_KEY: keypad_activate(key); break;
+    default: break;
     }
-    if (covered()) { if (!swiped) set_cover(0.0); return; }
-    int i = keypad.pressed;
-    if (i < 0) return;
-    keypad.pressed = -1;
-    if (loginui_keypad_key_at(&keypad, x, y) == i) keypad_activate(i);
-    else render_all();
 }
 
 static void pt_enter(void *d, struct wl_pointer *p, uint32_t s, struct wl_surface *sf, wl_fixed_t x, wl_fixed_t y) {
@@ -1373,26 +1331,24 @@ static const struct wl_pointer_listener pointer_listener = {
 
 static void tc_down(void *d, struct wl_touch *t, uint32_t serial, uint32_t time,
                     struct wl_surface *sf, int32_t id, wl_fixed_t x, wl_fixed_t y) {
-    if (touch_id >= 0) return;
-    touch_id = id;
-    touch_x = wl_fixed_to_double(x); touch_y = wl_fixed_to_double(y);
-    input_press(touch_x, touch_y);
+    if (gesture.touch_id >= 0) return;
+    gesture.touch_id = id;
+    gesture.touch_x = wl_fixed_to_double(x); gesture.touch_y = wl_fixed_to_double(y);
+    input_press(gesture.touch_x, gesture.touch_y);
 }
 static void tc_up(void *d, struct wl_touch *t, uint32_t serial, uint32_t time, int32_t id) {
-    if (id != touch_id) return;
-    touch_id = -1;
-    input_release(touch_x, touch_y);
+    if (id != gesture.touch_id) return;
+    gesture.touch_id = -1;
+    input_release(gesture.touch_x, gesture.touch_y);
 }
 static void tc_motion(void *d, struct wl_touch *t, uint32_t time, int32_t id, wl_fixed_t x, wl_fixed_t y) {
-    if (id != touch_id) return;
-    touch_x = wl_fixed_to_double(x); touch_y = wl_fixed_to_double(y);
-    input_motion(touch_x, touch_y);
+    if (id != gesture.touch_id) return;
+    gesture.touch_x = wl_fixed_to_double(x); gesture.touch_y = wl_fixed_to_double(y);
+    input_motion(gesture.touch_x, gesture.touch_y);
 }
 static void tc_frame(void *d, struct wl_touch *t) {}
 static void tc_cancel(void *d, struct wl_touch *t) {
-    touch_id = -1;
-    pressing = false;
-    if (keypad.pressed >= 0) { keypad.pressed = -1; render_all(); }
+    if (loginui_gesture_cancel(&gesture, &keypad)) render_all();
 }
 static void tc_shape(void *d, struct wl_touch *t, int32_t id, wl_fixed_t major, wl_fixed_t minor) {}
 static void tc_orientation(void *d, struct wl_touch *t, int32_t id, wl_fixed_t orientation) {}
@@ -1430,7 +1386,7 @@ static void kb_repeat(void *d, struct wl_keyboard *kb, int32_t rate, int32_t del
 static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
                    uint32_t time, uint32_t key, uint32_t state) {
     if (handoff || applying_update || !xkb_state || state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
-    last_input = handoff_now();
+    gesture.last_input = handoff_now();
     if (covered()) set_cover(0.0);
     xkb_keycode_t kc = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, kc);
@@ -1601,7 +1557,7 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
     } else if (!has_touch && touch) {
         wl_touch_release(touch);
         touch = NULL;
-        touch_id = -1;
+        gesture.touch_id = -1;
     }
     if (has_keyboard && !keyboard) {
         keyboard = wl_seat_get_keyboard(s);
@@ -1816,6 +1772,7 @@ static void keyd_attach(const char *username) {
 }
 
 int main(int argc, char **argv) {
+    loginui_gesture_init(&gesture);
     t_start_ms = now_ms();
     phase("main entered");
     for (int i = 1; i < argc; i++) {
@@ -1895,7 +1852,7 @@ int main(int argc, char **argv) {
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, handoff || applying_update ? 100 : cover != cover_target ? 16 : 1000);
+        int pr = poll(pfds, 2, handoff || applying_update ? 100 : loginui_gesture_animating(&gesture) ? 16 : 1000);
 
         if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             wl_display_cancel_read(display);
@@ -1921,8 +1878,8 @@ int main(int argc, char **argv) {
         if (handoff) continue;
         applying_update_tick();
         cover_tick();
-        if (keypad_shown && cover_target == 0.0 && password_len == 0 && !awaiting_auth && !recovery_mode &&
-            !pressing && handoff_now() - last_input > 30.0)
+        if (password_len == 0 && !awaiting_auth && !recovery_mode &&
+            loginui_gesture_idle(&gesture, keypad_shown, handoff_now(), 30.0))
             set_cover(1.0);
 
         time_t now = time(NULL);
