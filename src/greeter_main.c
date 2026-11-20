@@ -31,6 +31,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 #include "loginui.h"
+#include <sinty-system/v1.h>
 
 /* ── model ──────────────────────────────────────────────────────────────── */
 
@@ -1283,7 +1284,10 @@ static void input_press(double x, double y) {
         pointer_click();
         return;
     }
-    switch (loginui_gesture_press(&gesture, &keypad, keypad_shown, x, y, handoff_now())) {
+    int before = keypad.pressed;
+    LoginUiGestureEvent ev = loginui_gesture_press(&gesture, &keypad, keypad_shown, x, y, handoff_now());
+    if (keypad_shown && keypad.pressed >= 0 && keypad.pressed != before) sinty_haptic_key();
+    switch (ev) {
     case LOGINUI_GESTURE_REDRAW: render_all(); break;
     case LOGINUI_GESTURE_TAP: pointer_click(); break;
     default: break;
