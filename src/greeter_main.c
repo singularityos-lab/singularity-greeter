@@ -154,10 +154,12 @@ static void badge_end(void);
 
 /* ── chrome + render ────────────────────────────────────────────────────── */
 
+#define PANEL_RADIUS 16
+
 static const char *power_labels[3] = { "Sleep", "Restart", "Shut Down" };
 
 static void draw_power_glyph(cairo_t *cr, double cx, double cy, double r) {
-    cairo_set_source_rgba(cr, 0.96, 0.96, 0.98, 0.96);
+    loginui_set_color(cr, loginui_style()->text);
     cairo_set_line_width(cr, 2);
     cairo_arc(cr, cx, cy, r * 0.42, -60 * (3.14159265 / 180.0), 240 * (3.14159265 / 180.0));
     cairo_stroke(cr);
@@ -243,19 +245,26 @@ static void draw_crash_panel(cairo_t *cr, int w, int h) {
     int shown = crash_nlines - start;
     double lh = 18, pad = 14;
     double ph = (shown + 1) * lh + pad * 2 + 8;
-    double pw = w * 0.86, px = (w - pw) / 2.0, py = h - ph - 72;
+    double pw = w * 0.86, px = (w - pw) / 2.0, py = h - ph - (loginui_compact(w, h) ? 102 : 72);
     if (py < 8) py = 8;
-    loginui_rounded_rect(cr, px, py, pw, ph, 10);
-    cairo_set_source_rgba(cr, 0.10, 0.02, 0.02, 0.94);
-    cairo_fill(cr);
-    loginui_text(cr, "Sans Bold 13", "Desktop error - photograph this screen",
-                 px + pad, py + pad, 0, 1.0, 0.62, 0.55);
+    const char *title = "Desktop error - photograph this screen", *title_font = "Sans Bold 13";
+    int tw = 0, th = 0;
+    loginui_text_size(cr, title_font, title, &tw, &th);
+    if (tw > pw - 2 * pad) title_font = "Sans Bold 11";
+    const LoginUiStyle *style = loginui_style();
+    loginui_surface(cr, px, py, pw, ph, PANEL_RADIUS);
+    cairo_save(cr);
+    cairo_rectangle(cr, px + pad, py, pw - 2 * pad, ph);
+    cairo_clip(cr);
+    loginui_text(cr, title_font, title,
+                 px + pad, py + pad, 0, style->error.r, style->error.g, style->error.b);
     double ty = py + pad + lh + 6;
     for (int i = start; i < crash_nlines; i++) {
         loginui_text(cr, "Monospace 10", crash_lines[i],
-                     px + pad, ty, 0, 0.90, 0.90, 0.92);
+                     px + pad, ty, 0, style->text.r, style->text.g, style->text.b);
         ty += lh;
     }
+    cairo_restore(cr);
 }
 
 static double handoff_now(void) {
@@ -347,13 +356,13 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
                 cairo_set_source_surface(cr, users[i].avatar, 0, 0);
                 cairo_paint(cr);
             } else {
-                cairo_set_source_rgba(cr, 1, 1, 1, 0.12);
+                loginui_set_color(cr, loginui_style()->card);
                 cairo_paint(cr);
             }
             cairo_restore(cr);
             if (i == sel_user) {
                 cairo_arc(cr, ux + a / 2, y + a / 2, a / 2 + 2, 0, 2 * 3.14159265);
-                cairo_set_source_rgba(cr, 1, 1, 1, 0.85);
+                loginui_set_color(cr, loginui_style()->focus);
                 cairo_set_line_width(cr, 2);
                 cairo_stroke(cr);
             }
@@ -367,10 +376,9 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
         loginui_text_size(cr, "Sans 12", sname, &tw, &th);
         double cw2 = tw + 28, chh = 28;
         double sx = compact ? 16 : w - 16 - cw2, sy = compact ? 18 : h - 16 - chh;
-        loginui_rounded_rect(cr, sx, sy, cw2, chh, 14);
-        cairo_set_source_rgba(cr, 0.13, 0.13, 0.14, 0.92);
-        cairo_fill(cr);
-        loginui_text(cr, "Sans 12", sname, sx + cw2 / 2.0, sy + (chh - th) / 2.0, 1, 0.9, 0.9, 0.93);
+        LoginUiColor text = loginui_style()->text;
+        loginui_surface(cr, sx, sy, cw2, chh, chh / 2.0);
+        loginui_text(cr, "Sans 12", sname, sx + cw2 / 2.0, sy + (chh - th) / 2.0, 1, text.r, text.g, text.b);
         session_hit = (struct rect){ sx, sy, cw2, chh, true };
     }
     (void)cx; (void)cy; (void)cw; (void)ch;
@@ -383,21 +391,18 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
     }
 
     double pr = 18, pcx = w - 36, pcy = 36;
-    loginui_rounded_rect(cr, pcx - pr, pcy - pr, 2 * pr, 2 * pr, pr);
-    cairo_set_source_rgba(cr, 0.13, 0.13, 0.14, 0.92);
-    cairo_fill(cr);
+    loginui_surface(cr, pcx - pr, pcy - pr, 2 * pr, 2 * pr, pr);
     draw_power_glyph(cr, pcx, pcy, pr);
     power_hit = (struct rect){ pcx - pr, pcy - pr, 2 * pr, 2 * pr, true };
     for (int i = 0; i < 3; i++) power_item[i].valid = false;
     if (power_open) {
         double mw = 160, mh = 36, mx = w - 16 - mw, my = pcy + pr + 8;
-        loginui_rounded_rect(cr, mx, my, mw, mh * 3 + 8, 12);
-        cairo_set_source_rgba(cr, 0.176, 0.176, 0.176, 0.98);
-        cairo_fill(cr);
+        LoginUiColor text = loginui_style()->text;
+        loginui_surface(cr, mx, my, mw, mh * 3 + 8, PANEL_RADIUS);
         for (int i = 0; i < 3; i++) {
             double iy = my + 4 + i * mh;
             power_item[i] = (struct rect){ mx, iy, mw, mh, true };
-            loginui_text(cr, "Sans 12", power_labels[i], mx + 14, iy + (mh - 16) / 2.0, 0, 0.92, 0.92, 0.94);
+            loginui_text(cr, "Sans 12", power_labels[i], mx + 14, iy + (mh - 16) / 2.0, 0, text.r, text.g, text.b);
         }
     }
 
@@ -1879,10 +1884,10 @@ int main(int argc, char **argv) {
         if (greetd_fd >= 0 && !handoff && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
         while (g_main_context_iteration(NULL, FALSE));
         if (handoff_tick()) { running = false; break; }
-        if (loginui_caret_tick()) render_all();
         if (handoff) continue;
         applying_update_tick();
         cover_tick();
+        if (loginui_caret_tick()) render_all();
         if (password_len == 0 && !awaiting_auth && !recovery_mode &&
             loginui_gesture_idle(&gesture, keypad_shown, handoff_now(), 30.0))
             set_cover(1.0);
