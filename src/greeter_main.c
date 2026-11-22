@@ -1034,7 +1034,7 @@ static void load_users(void) {
             snprintf(u->realname, sizeof u->realname, "%s", pw->pw_gecos);
             char *comma = strchr(u->realname, ','); if (comma) *comma = '\0';
         }
-        if (u->realname[0] == '\0') snprintf(u->realname, sizeof u->realname, "%s", u->username);
+        if (u->realname[0] == '\0') memcpy(u->realname, u->username, sizeof u->realname);
         u->avatar = load_user_avatar(u->username);
         u->bg = load_user_bg(u->username);
     }
