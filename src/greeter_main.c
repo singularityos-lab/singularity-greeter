@@ -304,7 +304,7 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
     st.date_str = dbuf;
     st.avatar = u ? u->avatar : NULL;
     st.background = u ? u->bg : NULL;
-    st.password_dots = (int)password_len;
+    st.password_dots = loginui_password_chars(password, password_len);
     st.status_text = status_text[0] ? status_text : key_text() ? key_text() : (sinty_guest() ? "Guest mode: nothing is kept on this computer" : gpu_text);
     st.status_error = status_error;
     if (recovery_mode)
@@ -1856,7 +1856,7 @@ int main(int argc, char **argv) {
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
 
-        int pr = poll(pfds, 2, handoff || applying_update ? 100 : loginui_gesture_animating(&gesture) ? 16 : 1000);
+        int pr = poll(pfds, 2, handoff || applying_update ? 100 : loginui_gesture_animating(&gesture) ? 16 : loginui_caret_timeout(1000));
 
         if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             wl_display_cancel_read(display);
@@ -1879,6 +1879,7 @@ int main(int argc, char **argv) {
         if (greetd_fd >= 0 && !handoff && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
         while (g_main_context_iteration(NULL, FALSE));
         if (handoff_tick()) { running = false; break; }
+        if (loginui_caret_tick()) render_all();
         if (handoff) continue;
         applying_update_tick();
         cover_tick();
