@@ -69,6 +69,8 @@ static bool status_error = false;
 static bool awaiting_auth = false;
 static bool auth_prompt_waiting = false;
 static bool auth_restart_pending = false;
+static int requests_in_flight = 0;
+static int replies_until_cancel_ack = 0;
 
 static int greetd_fd = -1;
 static bool preview = false;
@@ -606,7 +608,7 @@ static void greetd_send_object(JsonBuilder *b) {
     json_generator_set_root(g, json_builder_get_root(b));
     gsize jlen = 0;
     char *json = json_generator_to_data(g, &jlen);
-    greetd_send(json);
+    if (greetd_send(json)) requests_in_flight++;
     g_free(json);
     g_object_unref(g);
     g_object_unref(b);
@@ -647,6 +649,7 @@ static void greetd_cancel_session(void) {
     json_builder_begin_object(b);
     json_builder_set_member_name(b, "type"); json_builder_add_string_value(b, "cancel_session");
     greetd_send_object(b);
+    replies_until_cancel_ack = requests_in_flight;
 }
 
 static bool sinty_tier_tpm(void) {
@@ -830,6 +833,16 @@ static void greetd_handle(void) {
     if (!payload) return;
     if (!read_exact(greetd_fd, payload, len)) { free(payload); running = false; return; }
     payload[len] = '\0';
+    if (requests_in_flight > 0) requests_in_flight--;
+    if (replies_until_cancel_ack > 0) {
+        if (--replies_until_cancel_ack == 0) {
+            awaiting_auth = false;
+            auth_prompt_waiting = false;
+            if (auth_restart_pending && !recovery_mode) begin_authentication();
+        }
+        free(payload);
+        return;
+    }
 
     JsonParser *p = json_parser_new();
     if (json_parser_load_from_data(p, payload, len, NULL)) {
@@ -909,7 +922,10 @@ static void greetd_handle(void) {
                     status_error = true;
                 }
                 bool failed = status_error;
-                if (was_authenticating && !recovery_mode) begin_authentication();
+                if (was_authenticating && !recovery_mode) {
+                    auth_restart_pending = true;
+                    greetd_cancel_session();
+                }
                 status_error = failed;
                 render_all();
             }
