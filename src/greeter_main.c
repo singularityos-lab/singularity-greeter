@@ -1869,16 +1869,37 @@ int main(int argc, char **argv) {
     begin_authentication();
     int wfd = wl_display_get_fd(display);
     int last_min = -1;
+    GMainContext *ctx = g_main_context_default();
+    GPollFD gfds[64];
     while (running) {
         while (wl_display_prepare_read(display) != 0)
             wl_display_dispatch_pending(display);
         wl_display_flush(display);
 
-        struct pollfd pfds[2];
+        gboolean acq = g_main_context_acquire(ctx);
+        gint max_pri = 0, gl_timeout = -1;
+        int nf = 0;
+        if (acq) {
+            g_main_context_prepare(ctx, &max_pri);
+            nf = g_main_context_query(ctx, max_pri, &gl_timeout, gfds, G_N_ELEMENTS(gfds));
+            if (nf > (int)G_N_ELEMENTS(gfds)) nf = G_N_ELEMENTS(gfds);
+        }
+
+        struct pollfd pfds[2 + G_N_ELEMENTS(gfds)];
         pfds[0].fd = wfd; pfds[0].events = POLLIN; pfds[0].revents = 0;
         pfds[1].fd = handoff ? -1 : greetd_fd; pfds[1].events = POLLIN; pfds[1].revents = 0;
+        for (int i = 0; i < nf; i++) {
+            pfds[i + 2].fd = gfds[i].fd;
+            pfds[i + 2].events = gfds[i].events;
+            pfds[i + 2].revents = 0;
+        }
 
-        int pr = poll(pfds, 2, handoff || applying_update ? 100 : loginui_gesture_animating(&gesture) ? 16 : loginui_caret_timeout(1000));
+        bool idle_armed = password_len == 0 && !awaiting_auth && !recovery_mode;
+        int timeout = handoff || applying_update ? 100
+            : loginui_next_wakeup(&gesture, keypad_shown, idle_armed, handoff_now(), 30.0);
+        if (gl_timeout >= 0 && gl_timeout < timeout) timeout = gl_timeout;
+
+        int pr = poll(pfds, 2 + nf, timeout);
 
         if (pr > 0 && (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL))) {
             wl_display_cancel_read(display);
@@ -1899,7 +1920,12 @@ int main(int argc, char **argv) {
         }
 
         if (greetd_fd >= 0 && !handoff && pr > 0 && (pfds[1].revents & (POLLIN | POLLHUP))) greetd_handle();
-        while (g_main_context_iteration(NULL, FALSE));
+        if (acq) {
+            for (int i = 0; i < nf; i++) gfds[i].revents = pfds[i + 2].revents;
+            g_main_context_check(ctx, max_pri, gfds, nf);
+            g_main_context_dispatch(ctx);
+            g_main_context_release(ctx);
+        }
         if (handoff_tick()) { running = false; break; }
         if (handoff) continue;
         applying_update_tick();
