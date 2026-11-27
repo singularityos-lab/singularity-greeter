@@ -27,6 +27,7 @@
 #include <glib.h>
 #include <gio/gio.h>
 #include <json-glib/json-glib.h>
+#include <pango/pangocairo.h>
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
@@ -269,6 +270,94 @@ static void draw_crash_panel(cairo_t *cr, int w, int h) {
     cairo_restore(cr);
 }
 
+static char notice_title[256];
+static char notice_text[4096];
+static bool notice_pending = false;
+static struct rect notice_hit;
+
+static bool policy_string(JsonObject *o, const char *key, char *out, size_t n) {
+    JsonNode *node = json_object_get_member(o, key);
+    if (!node || !JSON_NODE_HOLDS_VALUE(node) || json_node_get_value_type(node) != G_TYPE_STRING) return false;
+    snprintf(out, n, "%s", json_node_get_string(node));
+    g_strstrip(out);
+    return out[0] != 0;
+}
+
+static void load_signin_notice(void) {
+    const char *path = getenv("SINTY_POLICY_FILE");
+    if (!path || !path[0]) path = "/var/lib/sinty-it/policy.json";
+    notice_title[0] = notice_text[0] = 0;
+    JsonParser *parser = json_parser_new();
+    if (json_parser_load_from_file(parser, path, NULL)) {
+        JsonNode *root = json_parser_get_root(parser);
+        if (root && JSON_NODE_HOLDS_OBJECT(root)) {
+            JsonObject *o = json_node_get_object(root);
+            if (policy_string(o, "signin.notice-text", notice_text, sizeof notice_text) &&
+                !policy_string(o, "signin.notice-title", notice_title, sizeof notice_title))
+                snprintf(notice_title, sizeof notice_title, "Notice");
+        }
+    }
+    g_object_unref(parser);
+    notice_pending = notice_text[0] != 0;
+}
+
+static void accept_signin_notice(void) {
+    notice_pending = false;
+    notice_hit.valid = false;
+    render_all();
+}
+
+static void draw_signin_notice(cairo_t *cr, int w, int h) {
+    notice_hit.valid = false;
+    if (!notice_pending) return;
+    const LoginUiStyle *style = loginui_style();
+    cairo_save(cr);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
+    cairo_paint(cr);
+    cairo_restore(cr);
+
+    double pad = 28, bh = 40, bw = 160;
+    double pw = w - 32 < 560 ? w - 32 : 560;
+    int title_w = 0, title_h = 0;
+    loginui_text_size(cr, "Sans Bold 16", notice_title, &title_w, &title_h);
+
+    PangoLayout *layout = pango_cairo_create_layout(cr);
+    PangoFontDescription *fd = pango_font_description_from_string("Sans 12");
+    pango_layout_set_font_description(layout, fd);
+    pango_font_description_free(fd);
+    pango_layout_set_width(layout, (int)((pw - 2 * pad) * PANGO_SCALE));
+    pango_layout_set_wrap(layout, PANGO_WRAP_WORD_CHAR);
+    pango_layout_set_text(layout, notice_text, -1);
+    double room = h - 2 * 24 - 2 * pad - title_h - 14 - 24 - bh;
+    int text_w = 0, text_h = 0;
+    pango_layout_get_pixel_size(layout, &text_w, &text_h);
+    if (room > 40 && text_h > room) {
+        pango_layout_set_height(layout, (int)(room * PANGO_SCALE));
+        pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+        pango_layout_get_pixel_size(layout, &text_w, &text_h);
+    }
+
+    double ph = pad + title_h + 14 + text_h + 24 + bh + pad;
+    double px = (w - pw) / 2.0, py = (h - ph) / 2.0;
+    loginui_surface(cr, px, py, pw, ph, PANEL_RADIUS);
+    loginui_text(cr, "Sans Bold 16", notice_title, px + pad, py + pad, 0,
+                 style->text.r, style->text.g, style->text.b);
+    cairo_move_to(cr, px + pad, py + pad + title_h + 14);
+    loginui_set_color(cr, style->text);
+    pango_cairo_show_layout(cr, layout);
+    g_object_unref(layout);
+
+    double bx = px + pw - pad - bw, by = py + ph - pad - bh;
+    loginui_rounded_rect(cr, bx, by, bw, bh, bh / 2.0);
+    loginui_set_color(cr, style->accent);
+    cairo_fill(cr);
+    int lw = 0, lh = 0;
+    loginui_text_size(cr, "Sans Bold 12", "Accept", &lw, &lh);
+    loginui_text(cr, "Sans Bold 12", "Accept", bx + bw / 2.0, by + (bh - lh) / 2.0, 1,
+                 style->accent_fg.r, style->accent_fg.g, style->accent_fg.b);
+    notice_hit = (struct rect){ bx, by, bw, bh, true };
+}
+
 static double handoff_now(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -409,6 +498,7 @@ static void render_surface(struct wl_surface *surface, struct loginui_buffer **p
     }
 
     draw_crash_panel(cr, w, h);
+    draw_signin_notice(cr, w, h);
 
     if (handoff) {
         cairo_push_group(cr);
@@ -1300,6 +1390,10 @@ static void keypad_activate(int i) {
 static void input_press(double x, double y) {
     if (handoff || applying_update) return;
     ptr_x = x; ptr_y = y;
+    if (notice_pending) {
+        if (in_rect(&notice_hit)) accept_signin_notice();
+        return;
+    }
     if (power_open || in_rect(&power_hit)) {
         gesture.last_input = handoff_now();
         gesture.pressing = false;
@@ -1323,6 +1417,7 @@ static void input_motion(double x, double y) {
 }
 
 static void input_release(double x, double y) {
+    if (notice_pending) return;
     int key = -1;
     switch (loginui_gesture_release(&gesture, &keypad, keypad_shown, x, y, handoff_now(), &key)) {
     case LOGINUI_GESTURE_REDRAW: render_all(); break;
@@ -1416,6 +1511,11 @@ static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
     if (covered()) set_cover(0.0);
     xkb_keycode_t kc = key + 8;
     xkb_keysym_t sym = xkb_state_key_get_one_sym(xkb_state, kc);
+
+    if (notice_pending) {
+        if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter || sym == XKB_KEY_space) accept_signin_notice();
+        return;
+    }
 
     switch (sym) {
     case XKB_KEY_Return:
@@ -1821,6 +1921,7 @@ int main(int argc, char **argv) {
 
     load_users();
     phase("users loaded");
+    if (!recovery_mode) load_signin_notice();
     load_sessions();
     phase("sessions loaded");
     restore_last_user();
